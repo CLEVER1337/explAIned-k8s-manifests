@@ -4,9 +4,13 @@ Kubernetes manifests for the explAIned stack: six .NET services, two Python serv
 offline jobs, five stateful dependencies and the monitoring pair — as plain YAML with
 kustomize overlays. No Helm, no operators, nothing to install before `kubectl apply`.
 
-The sources live in the sibling repo (`../explAIned`). Nothing here is generated from it; the
-three files that are copies of upstream files are listed under [Vendored files](#vendored-files)
-and there is a `make check-drift` target that fails when they rot.
+This directory sits inside the explAIned tree next to the services it deploys, and carries its
+own git history — it deploys the stack, it is not part of it, and it moves on a release
+cadence rather than on a feature one. Everything below resolves paths against the parent
+directory (`SRC` in the Makefile), so nothing needs a checkout anywhere else.
+
+Nothing here is generated from the sources. The three files that are copies of upstream files
+are listed under [Vendored files](#vendored-files), and `make check-drift` fails when they rot.
 
 ```
 base/
@@ -31,8 +35,9 @@ Needs kustomize v5 syntax — `kubectl` 1.27+ (its built-in kustomize) or a stan
 the v4 vintage still shipped with older kubectl.
 
 ```bash
-# 1. Build the nine images. TAG=dev is what overlays/dev expects.
-make images SRC=../explAIned TAG=dev
+# 1. Build the nine images, from the service directories one level up.
+#    TAG=dev is what overlays/dev expects.
+make images TAG=dev
 
 # 2. Load them into your cluster (kind shown; minikube uses `minikube image load`)
 for i in identity article comment profile recommendation event-consumer faiss ranking; do
@@ -153,9 +158,12 @@ together or neither.
 
 ## Vendored files
 
-Three files are copies of files in `../explAIned`:
+Three files are copies of files from the parent directory. Copies rather than symlinks on
+purpose: `kustomize build` follows the file into the ConfigMap, so a symlink pointing outside
+the kustomization root would break the build the moment this directory is rendered from
+anywhere else.
 
-| here | upstream |
+| here | upstream (relative to `..`) |
 |---|---|
 | `base/infra/files/clickhouse-schema.sql` | `explAInedArticleEventConsumerService/schema.sql` |
 | `base/monitoring/files/recommendations.yml` | `monitoring/rules/recommendations.yml` |

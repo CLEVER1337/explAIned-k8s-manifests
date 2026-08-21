@@ -3,8 +3,10 @@ NAMESPACE ?= explained
 REGISTRY ?= explained
 TAG ?= dev
 
-# Where the service sources live. Every image is built from its own directory in that repo.
-SRC ?= ../explAIned
+# Where the service sources live. Every image is built from its own directory up there.
+# This directory sits inside the explAIned tree alongside the services, so the default is
+# simply the parent.
+SRC ?= ..
 
 .PHONY: help build diff apply delete restart images sync-upstream check-drift
 
