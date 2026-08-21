@@ -1,0 +1,68 @@
+# One PDB per multi-replica request-path Deployment, so a node drain cannot take the last
+# replica of an API with it.
+#
+# Two workloads deliberately have none:
+#   event-consumer-service  runs a single replica. A PDB with minAvailable: 1 would make the
+#                           pod undrainable and block node maintenance forever, to protect a
+#                           sink whose worst case is a few seconds of consumer lag.
+#   faiss-service           same reason — one replica by design, because the index is a full
+#                           in-memory copy per pod.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: identity-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: identity-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: article-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: article-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: comment-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: comment-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: profile-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: profile-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: recommendation-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: recommendation-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ranking-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ranking-service

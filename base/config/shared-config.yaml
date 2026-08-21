@@ -1,0 +1,55 @@
+# Addressable building blocks, not finished settings.
+#
+# Every workload pulls this in with `envFrom`, then composes the shape its own runtime wants
+# out of the pieces — `ConnectionStrings__PostgreSQL` for .NET, `REDIS_URL` for Python. The
+# kubelet expands $(VAR) in an `env` entry against everything already in scope, envFrom
+# included, so the composition happens in the manifest and the secret never has to carry a
+# whole connection string just to hide one password.
+#
+# Service DNS names are short on purpose: they resolve inside whatever namespace this is
+# applied to, so an overlay can stand a second copy of the stack up next to the first without
+# editing a single value here.
+#
+# This one ConfigMap is hand-written instead of generated, so that it can carry these comments.
+# The cost is that it has no content hash in its name: editing a value here updates the
+# ConfigMap in place and running pods keep the old environment until they are restarted.
+# `make restart` does that; every other ConfigMap in this repo rolls on its own.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: explained-endpoints
+  labels:
+    app.kubernetes.io/component: config
+data:
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: postgres
+
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_ARTICLES_TOPIC: articles.events
+  KAFKA_USER_EVENTS_TOPIC: user.events
+
+  # http, not https: TLS is terminated at the ingress and the article service talks to ES over
+  # the pod network. The client-side `ServerCertificateValidationCallback => true` in
+  # Program.cs stops mattering the moment there is no certificate to not-validate.
+  ELASTICSEARCH_URL: http://elasticsearch:9200
+  ELASTICSEARCH_USERNAME: elastic
+
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_DATABASE: explained
+
+  # One issuer/audience string, one place. Identity mints tokens with these and the other four
+  # services validate against them — they have to agree character for character, including the
+  # trailing slash. Changing this invalidates every token already in the wild.
+  JWT_ISSUER: http://identity-service:5125/
+  JWT_AUDIENCE: http://identity-service:5125/
+
+  IDENTITY_BASE_URL: http://identity-service:5125
+  ARTICLES_BASE_URL: http://article-service:5036
+  COMMENTS_BASE_URL: http://comment-service:5046
+  PROFILES_BASE_URL: http://profile-service:5066
+  FAISS_BASE_URL: http://faiss-service:8001
+  RANKING_BASE_URL: http://ranking-service:8002

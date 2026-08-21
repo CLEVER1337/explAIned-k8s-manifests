@@ -1,0 +1,96 @@
+# Alerts for the recommendation loop.
+#
+# The rule that shapes all of these: the feed never answers 5xx. It degrades instead, and it
+# reports how far it degraded in `feed_requests_total{level}`. So alerting on error rates would
+# monitor a signal that is designed never to fire — the real symptom is a healthy-looking 200
+# that contains a worse answer than it should.
+
+groups:
+  - name: feed-degradation
+    rules:
+      - alert: FeedMostlyDegraded
+        # `unranked` and below means personalization is not reaching users, whatever the cause.
+        expr: |
+          sum(rate(feed_requests_total{level=~"unranked|trending|recent|cached|empty"}[5m]))
+          /
+          clamp_min(sum(rate(feed_requests_total[5m])), 0.001)
+          > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'More than 20% of feeds are served below `partial`'
+          description: >-
+            Check, in order: ranking :8002 (/health shows model_loaded), FAISS :8001,
+            and the freshness of rec:meta:*:updated_at.
+
+      - alert: FeedServingEmpty
+        expr: sum(rate(feed_requests_total{level="empty"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'The feed is returning empty pages'
+          description: 'Every candidate source and every fallback failed, including the in-memory snapshot.'
+
+  - name: offline-freshness
+    rules:
+      # These come from the ranking service, which reads rec:meta:*:updated_at on a timer.
+      # A dead job has no other symptom: the data simply stops changing, and every consumer
+      # keeps serving the last good value until it expires.
+      - alert: TrendingStale
+        expr: ml_artifact_age_seconds{artifact="trending"} > 1800
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'rec:trending:top100 has not been refreshed in 30 minutes'
+          description: 'update_trending runs every 10 minutes. Below the TTL the key vanishes and feeds drop to `recent`.'
+
+      - alert: EmbeddingsStale
+        expr: ml_artifact_age_seconds{artifact="article_embedding"} > 21600
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Article embeddings have not been refreshed in 6 hours'
+          description: 'New articles are unreachable through FAISS until the embeddings job runs and the index is rebuilt.'
+
+      - alert: FeatureRowsStale
+        expr: ml_artifact_age_seconds{artifact="features"} > 86400
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Feature rows are older than their TTL'
+          description: 'Rows are expiring faster than build_features replaces them; the ranker is scoring on neutral values.'
+
+  - name: ranking-service
+    rules:
+      - alert: RankerSignatureMismatch
+        # The model disagrees with the deployed feature_store. The service refuses to serve it,
+        # which is correct and also means someone must retrain or roll back.
+        expr: increase(ranking_model_reload_total{result="signature_mismatch"}[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: 'The registered model does not match the deployed feature schema'
+
+      - alert: RankerSlow
+        # The orchestrator's deadline is 120 ms including HTTP; in-service p99 should sit far
+        # below it, or every slow tail becomes a silent drop to `unranked`.
+        expr: histogram_quantile(0.99, sum(rate(ranking_rank_seconds_bucket[5m])) by (le)) > 0.08
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: '/rank p99 is within reach of the orchestrator deadline'
+
+      - alert: RankerHasNoModel
+        expr: ranking_model_loaded == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'The ranking service is up but serving no model'
+          description: 'Normal before the first promotion; after that it means the alias is gone or the registry is unreachable.'

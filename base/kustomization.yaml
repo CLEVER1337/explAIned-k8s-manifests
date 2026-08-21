@@ -1,0 +1,105 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: explained
+
+# includeSelectors: false — this is a marker for humans and for NetworkPolicy selectors, not
+# something that belongs in a Deployment's immutable `spec.selector`.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: explained
+
+resources:
+  - namespace.yaml
+  - storage/pvc.yaml
+  - config/shared-config.yaml
+
+  - infra/postgres.yaml
+  - infra/redis.yaml
+  - infra/kafka.yaml
+  - infra/elasticsearch.yaml
+  - infra/clickhouse.yaml
+
+  - services/identity.yaml
+  - services/article.yaml
+  - services/comment.yaml
+  - services/profile.yaml
+  - services/recommendation.yaml
+  - services/event-consumer.yaml
+  - services/faiss.yaml
+  - services/ranking.yaml
+  - services/pdb.yaml
+
+  - jobs/faiss-build-index.yaml
+  - jobs/ml-cronjobs.yaml
+
+  - monitoring/prometheus.yaml
+  - monitoring/grafana.yaml
+
+  - ingress.yaml
+
+# Generated rather than checked in as ConfigMap manifests, for one reason: kustomize appends a
+# content hash to the name, so editing any of these files renames the ConfigMap and the
+# workloads mounting it roll automatically. A hand-written ConfigMap changes in place and the
+# pods keep running with the old content until someone restarts them by hand.
+#
+# (explained-endpoints in config/shared-config.yaml is the deliberate exception — it is
+# hand-written so it can carry its comments, which means editing it needs an explicit
+# `kubectl rollout restart`. The Makefile target does that.)
+configMapGenerator:
+  - name: clickhouse-schema-sql
+    files:
+      # Verbatim copy of explAInedArticleEventConsumerService/schema.sql. `make sync-upstream`
+      # refreshes it; the drift check in the README catches it going stale.
+      - infra/files/clickhouse-schema.sql
+
+  # Both of these replace the appsettings.json inside their image, and both are smaller than
+  # the file they replace. The reason is in the files themselves — short version: those two
+  # services re-add appsettings.json as the last configuration provider, which puts it above
+  # environment variables, so anything left in the file cannot be overridden from the
+  # Deployment.
+  - name: recommendation-appsettings
+    files:
+      - appsettings.json=config/recommendation-appsettings.json
+  - name: event-consumer-appsettings
+    files:
+      - appsettings.json=config/event-consumer-appsettings.json
+
+  - name: prometheus-config
+    files:
+      - monitoring/files/prometheus.yml
+  - name: prometheus-rules
+    files:
+      - monitoring/files/recommendations.yml
+  - name: grafana-datasources
+    files:
+      - monitoring/files/grafana-datasource.yml
+  - name: grafana-dashboard-provider
+    files:
+      - monitoring/files/grafana-dashboard-provider.yml
+  - name: grafana-dashboards
+    files:
+      - monitoring/files/microservices.json
+
+# Placeholders. Every overlay repoints these at a real registry and a real tag — `:dev` should
+# never reach a cluster anyone else depends on.
+images:
+  - name: explained/identity-service
+    newTag: dev
+  - name: explained/article-service
+    newTag: dev
+  - name: explained/comment-service
+    newTag: dev
+  - name: explained/profile-service
+    newTag: dev
+  - name: explained/recommendation-service
+    newTag: dev
+  - name: explained/event-consumer-service
+    newTag: dev
+  - name: explained/faiss-service
+    newTag: dev
+  - name: explained/ranking-service
+    newTag: dev
+  - name: explained/ml-jobs
+    newTag: dev

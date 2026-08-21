@@ -1,0 +1,386 @@
+# The six offline jobs that keep the recommendation loop supplied. All six run from the same
+# `explained/ml-jobs` image (Dockerfile.jobs — torch, sentence-transformers and the SBERT
+# weights baked in), and all six write Redis.
+#
+# ── The exit-code contract ───────────────────────────────────────────────────────────────
+# Every job exits 0 (did work) / 1 (nothing to do, previous data left untouched) / 2
+# (infrastructure down). That middle case is the interesting one: an empty result must never
+# overwrite a good artifact, because writing an empty rec:trending:top100 drops every user one
+# rung down the ladder while the feed keeps cheerfully answering 200.
+#
+# Kubernetes has no notion of "1 means fine", so each command translates it:
+#
+#     exit 1 → exit 0    nothing to do, not a failure, do not retry
+#     exit 2 → exit 2    infra down, let backoffLimit retry it
+#
+# Without that mapping every quiet run shows up as a failed Job and the real failures stop
+# standing out.
+#
+# ── concurrencyPolicy: Forbid ────────────────────────────────────────────────────────────
+# On all of them. Two train_als runs overlapping produce interleaved writes to
+# rec:user_als_candidates:*; two embeddings runs just burn CPU racing each other.
+#
+# ── Schedules ────────────────────────────────────────────────────────────────────────────
+# Staggered rather than aligned, because the chain has a real order:
+#   embeddings → (build-index, in jobs/faiss-build-index.yaml) → the FAISS candidate source
+#   build_features + train_als → train_lightgbm → the champion model
+# Cadence is bounded from above by the TTLs in explAIned-ml/config.py: trending expires after
+# an hour, ALS candidates after 48. A job that runs less often than its own TTL silently turns
+# personalization off.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-embeddings
+  labels:
+    app.kubernetes.io/name: ml-embeddings
+    app.kubernetes.io/component: job
+spec:
+  schedule: "0,30 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: ml-embeddings
+            app.kubernetes.io/component: job
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: embeddings
+              image: explained/ml-jobs
+              command:
+                - /bin/sh
+                - -c
+                - 'python -m explained_ml.jobs.embeddings; c=$?; [ $c -eq 1 ] && exit 0; exit $c'
+              envFrom:
+                - configMapRef:
+                    name: explained-endpoints
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-redis
+                      key: REDIS_PASSWORD
+                - name: REDIS_URL
+                  value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0
+                - name: CLICKHOUSE_URL
+                  value: $(CLICKHOUSE_URL)
+                - name: CLICKHOUSE_DATABASE
+                  value: $(CLICKHOUSE_DATABASE)
+                - name: ARTICLES_BASE_URL
+                  value: $(ARTICLES_BASE_URL)
+                # The weights are baked into the image at /opt/hf. Pointing HF_HOME anywhere
+                # else makes the first run re-download ~470 MB, which looks exactly like a
+                # hung job.
+                - name: HF_HOME
+                  value: /opt/hf
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: 2Gi
+                limits:
+                  # SBERT encoding is the heaviest thing in this repo. Under 2Gi the encoder
+                  # gets OOMKilled part-way through a batch and the run looks like exit 137.
+                  memory: 4Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-update-trending
+  labels:
+    app.kubernetes.io/name: ml-update-trending
+    app.kubernetes.io/component: job
+spec:
+  # Every 10 minutes against a 1-hour TTL: five missed runs before rec:trending:top100
+  # disappears and the `trending` rung goes with it.
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: ml-update-trending
+            app.kubernetes.io/component: job
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: update-trending
+              image: explained/ml-jobs
+              command:
+                - /bin/sh
+                - -c
+                - 'python -m explained_ml.jobs.update_trending; c=$?; [ $c -eq 1 ] && exit 0; exit $c'
+              envFrom:
+                - configMapRef:
+                    name: explained-endpoints
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-redis
+                      key: REDIS_PASSWORD
+                - name: REDIS_URL
+                  value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0
+                - name: CLICKHOUSE_URL
+                  value: $(CLICKHOUSE_URL)
+                - name: CLICKHOUSE_DATABASE
+                  value: $(CLICKHOUSE_DATABASE)
+                - name: ARTICLES_BASE_URL
+                  value: $(ARTICLES_BASE_URL)
+              resources:
+                requests:
+                  cpu: 200m
+                  memory: 512Mi
+                limits:
+                  memory: 1Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-build-user-embeddings
+  labels:
+    app.kubernetes.io/name: ml-build-user-embeddings
+    app.kubernetes.io/component: job
+spec:
+  # After ml-embeddings on the hour: a user embedding is an average of article embeddings, so
+  # running first just averages yesterday's.
+  schedule: "15 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: ml-build-user-embeddings
+            app.kubernetes.io/component: job
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: build-user-embeddings
+              image: explained/ml-jobs
+              command:
+                - /bin/sh
+                - -c
+                - 'python -m explained_ml.jobs.build_user_embeddings; c=$?; [ $c -eq 1 ] && exit 0; exit $c'
+              envFrom:
+                - configMapRef:
+                    name: explained-endpoints
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-redis
+                      key: REDIS_PASSWORD
+                - name: REDIS_URL
+                  value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0
+                - name: CLICKHOUSE_URL
+                  value: $(CLICKHOUSE_URL)
+                - name: CLICKHOUSE_DATABASE
+                  value: $(CLICKHOUSE_DATABASE)
+              resources:
+                requests:
+                  cpu: 500m
+                  memory: 1Gi
+                limits:
+                  memory: 2Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-build-features
+  labels:
+    app.kubernetes.io/name: ml-build-features
+    app.kubernetes.io/component: job
+spec:
+  schedule: "25 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: ml-build-features
+            app.kubernetes.io/component: job
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: build-features
+              image: explained/ml-jobs
+              command:
+                - /bin/sh
+                - -c
+                - 'python -m explained_ml.jobs.build_features; c=$?; [ $c -eq 1 ] && exit 0; exit $c'
+              envFrom:
+                - configMapRef:
+                    name: explained-endpoints
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-redis
+                      key: REDIS_PASSWORD
+                - name: REDIS_URL
+                  value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0
+                - name: CLICKHOUSE_URL
+                  value: $(CLICKHOUSE_URL)
+                - name: CLICKHOUSE_DATABASE
+                  value: $(CLICKHOUSE_DATABASE)
+                - name: ARTICLES_BASE_URL
+                  value: $(ARTICLES_BASE_URL)
+              resources:
+                requests:
+                  cpu: 500m
+                  memory: 1Gi
+                limits:
+                  memory: 2Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-train-als
+  labels:
+    app.kubernetes.io/name: ml-train-als
+    app.kubernetes.io/component: job
+spec:
+  # Daily, well inside the 48-hour TTL on rec:user_als_candidates:*.
+  schedule: "30 3 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: ml-train-als
+            app.kubernetes.io/component: job
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: train-als
+              image: explained/ml-jobs
+              command:
+                - /bin/sh
+                - -c
+                - 'python -m explained_ml.jobs.train_als; c=$?; [ $c -eq 1 ] && exit 0; exit $c'
+              envFrom:
+                - configMapRef:
+                    name: explained-endpoints
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-redis
+                      key: REDIS_PASSWORD
+                - name: REDIS_URL
+                  value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0
+                - name: CLICKHOUSE_URL
+                  value: $(CLICKHOUSE_URL)
+                - name: CLICKHOUSE_DATABASE
+                  value: $(CLICKHOUSE_DATABASE)
+                # implicit spawns a thread per core by default and thrashes under a CPU limit.
+                # Pinning it to the request keeps the factorisation predictable.
+                - name: OPENBLAS_NUM_THREADS
+                  value: "2"
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 2Gi
+                limits:
+                  memory: 4Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-train-lightgbm
+  labels:
+    app.kubernetes.io/name: ml-train-lightgbm
+    app.kubernetes.io/component: job
+spec:
+  # An hour after train_als and well after build_features: this trains on what they produced.
+  schedule: "30 4 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: ml-train-lightgbm
+            app.kubernetes.io/component: job
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: train-lightgbm
+              image: explained/ml-jobs
+              command:
+                - /bin/sh
+                - -c
+                - 'python -m explained_ml.jobs.train_lightgbm; c=$?; [ $c -eq 1 ] && exit 0; exit $c'
+              envFrom:
+                - configMapRef:
+                    name: explained-endpoints
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-redis
+                      key: REDIS_PASSWORD
+                - name: REDIS_URL
+                  value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0
+                - name: CLICKHOUSE_URL
+                  value: $(CLICKHOUSE_URL)
+                - name: CLICKHOUSE_DATABASE
+                  value: $(CLICKHOUSE_DATABASE)
+                # The one job that shares state with a running service: it writes the tracking
+                # DB and the artifacts that :8002 resolves `champion` out of. Same URIs as the
+                # ranking service, same volume — if these two disagree the model trains into a
+                # registry nobody reads.
+                - name: MLFLOW_TRACKING_URI
+                  value: sqlite:////app/mlruns/mlflow.db
+                - name: MLFLOW_REGISTRY_URI
+                  value: sqlite:////app/mlruns/mlflow.db
+                - name: MLFLOW_ARTIFACT_ROOT
+                  value: /app/mlruns/artifacts
+                - name: MLFLOW_EXPERIMENT
+                  value: explained-ranking
+                - name: MLFLOW_MODEL_NAME
+                  value: explained-ranker
+                - name: MLFLOW_MODEL_ALIAS
+                  value: champion
+              volumeMounts:
+                - name: mlflow
+                  mountPath: /app/mlruns
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 2Gi
+                limits:
+                  memory: 4Gi
+          volumes:
+            - name: mlflow
+              persistentVolumeClaim:
+                claimName: mlflow-store

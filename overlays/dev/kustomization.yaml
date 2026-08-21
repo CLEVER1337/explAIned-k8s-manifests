@@ -1,0 +1,172 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# A whole explAIned on one machine — kind, minikube, k3s, Docker Desktop. Sized to fit, not to
+# survive anything: one replica of everything, no autoscaling, no disruption budgets, small
+# heaps, small volumes.
+namespace: explained
+
+resources:
+  - ../../base
+
+# The dev credentials are committed on purpose. They are the same values already sitting in
+# the repo's appsettings.json files, so there is nothing here that is not already public, and
+# having them in git is what makes `kubectl apply -k overlays/dev` a one-liner. The prod
+# overlay does the opposite — see overlays/prod/README.md.
+secretGenerator:
+  - name: explained-postgres
+    envs:
+      - secrets/postgres.env
+  - name: explained-redis
+    envs:
+      - secrets/redis.env
+  - name: explained-elasticsearch
+    envs:
+      - secrets/elasticsearch.env
+  - name: explained-jwt
+    envs:
+      - secrets/jwt.env
+  - name: explained-grafana
+    envs:
+      - secrets/grafana.env
+
+replicas:
+  - name: identity-service
+    count: 1
+  - name: article-service
+    count: 1
+  - name: comment-service
+    count: 1
+  - name: profile-service
+    count: 1
+  - name: recommendation-service
+    count: 1
+  - name: ranking-service
+    count: 1
+
+patches:
+  # HPAs would immediately scale past the replica counts above and fight them, and on a
+  # single-node cluster there is nothing to scale onto anyway. Dropping them entirely is
+  # clearer than setting min=max=1 and pretending.
+  - target:
+      kind: HorizontalPodAutoscaler
+    patch: |
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: placeholder
+
+  # With one replica of everything, minAvailable: 1 means "never evictable" — `kubectl drain`
+  # on the only node would hang forever.
+  - target:
+      kind: PodDisruptionBudget
+    patch: |
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: placeholder
+
+  # 1 GB of heap plus 2 GB of limit is most of a laptop's headroom for a search index holding
+  # a few hundred articles.
+  #
+  # A strategic merge rather than a JSON patch: env lists merge by container name and env
+  # name, so this keeps working when someone adds a variable above ES_JAVA_OPTS. An
+  # index-based JSON patch would quietly rewrite whatever ended up at that position.
+  - target:
+      kind: StatefulSet
+      name: elasticsearch
+    patch: |
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: elasticsearch
+      spec:
+        template:
+          spec:
+            containers:
+              - name: elasticsearch
+                env:
+                  - name: ES_JAVA_OPTS
+                    value: -Xms512m -Xmx512m
+                resources:
+                  requests:
+                    memory: 768Mi
+                  limits:
+                    memory: 1Gi
+
+  # The offline jobs ask for 1–2 whole cores in base, which on a single-node cluster means
+  # Pending forever. They run slower like this; they still run.
+  - target:
+      kind: CronJob
+      name: ml-.*
+    patch: |
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/memory
+        value: 512Mi
+  - target:
+      kind: CronJob
+      name: faiss-build-index
+    patch: |
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/memory
+        value: 256Mi
+
+  # Volumes sized for a laptop. These are only honoured at first creation — an existing PVC is
+  # not resized by editing this.
+  - target:
+      kind: PersistentVolumeClaim
+      name: prometheus-data
+    patch: |
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: 5Gi
+  - target:
+      kind: StatefulSet
+      name: clickhouse
+    patch: |
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 5Gi
+
+  # local-path and hostPath provisioners hand out ReadWriteOnce and ignore the request for
+  # RWX. On one node that is survivable: every pod lands on the same machine, so the CronJob
+  # writer and the service reader still see the same directory. It stops working the moment
+  # there is a second node — which is exactly why prod does not do this.
+  - target:
+      kind: PersistentVolumeClaim
+      name: faiss-index|mlflow-store
+    patch: |
+      - op: replace
+        path: /spec/accessModes/0
+        value: ReadWriteOnce
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: 2Gi
+
+images:
+  - name: explained/identity-service
+    newTag: dev
+  - name: explained/article-service
+    newTag: dev
+  - name: explained/comment-service
+    newTag: dev
+  - name: explained/profile-service
+    newTag: dev
+  - name: explained/recommendation-service
+    newTag: dev
+  - name: explained/event-consumer-service
+    newTag: dev
+  - name: explained/faiss-service
+    newTag: dev
+  - name: explained/ranking-service
+    newTag: dev
+  - name: explained/ml-jobs
+    newTag: dev

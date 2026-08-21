@@ -1,0 +1,160 @@
+# LightGBM re-ranking. POST /rank {user_id, candidates} → {ranked: [{id, score}]} — ids only,
+# features never cross back to C#.
+#
+# Two things to know before changing anything here:
+#
+#  1. Feature order is a contract. feature_store.schema.FEATURES defines the column order,
+#     train_lightgbm records the names in the model's MLflow signature, and this service
+#     refuses to start when they disagree. A CrashLoopBackOff right after a training run is
+#     the guard working — read the logs before touching this file.
+#  2. The model is resolved through the `champion` alias, not a path. Promoting a model is an
+#     MLflow registry operation; MODEL_WATCH_SECONDS makes the service pick it up on its own,
+#     and POST /reload-model forces it. Neither needs a redeploy.
+#
+# MLflow here is SQLite on a shared volume, which is the honest dev shape and the first thing
+# to replace in prod — see the note on mlflow-store in storage/pvc.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ranking-service
+  labels:
+    app.kubernetes.io/name: ranking-service
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    app.kubernetes.io/name: ranking-service
+  ports:
+    - name: http
+      port: 8002
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ranking-service
+  labels:
+    app.kubernetes.io/name: ranking-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ranking-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ranking-service
+        app.kubernetes.io/component: api
+        explained.io/service: ranking
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8002"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: ranking-service
+          image: explained/ranking-service
+          ports:
+            - name: http
+              containerPort: 8002
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-redis
+                  key: REDIS_PASSWORD
+            - name: REDIS_URL
+              value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0
+            - name: CLICKHOUSE_URL
+              value: $(CLICKHOUSE_URL)
+            - name: CLICKHOUSE_DATABASE
+              value: $(CLICKHOUSE_DATABASE)
+            - name: ARTICLES_BASE_URL
+              value: $(ARTICLES_BASE_URL)
+            - name: PROFILES_BASE_URL
+              value: $(PROFILES_BASE_URL)
+            - name: IDENTITY_BASE_URL
+              value: $(IDENTITY_BASE_URL)
+            # Relative paths in the defaults (sqlite:///mlruns/..., ./mlruns/artifacts) resolve
+            # against the image's WORKDIR, /app — which is why the shared volume mounts there.
+            - name: MLFLOW_TRACKING_URI
+              value: sqlite:////app/mlruns/mlflow.db
+            - name: MLFLOW_REGISTRY_URI
+              value: sqlite:////app/mlruns/mlflow.db
+            - name: MLFLOW_ARTIFACT_ROOT
+              value: /app/mlruns/artifacts
+            - name: MLFLOW_EXPERIMENT
+              value: explained-ranking
+            - name: MLFLOW_MODEL_NAME
+              value: explained-ranker
+            - name: MLFLOW_MODEL_ALIAS
+              value: champion
+            - name: MODEL_WATCH_SECONDS
+              value: "300"
+            # A clamp, not a validation rule: a larger pool is truncated and served, never
+            # rejected. The feed asks for 200.
+            - name: MAX_CANDIDATES
+              value: "500"
+          volumeMounts:
+            - name: mlflow
+              mountPath: /app/mlruns
+          readinessProbe:
+            # Stays healthy with no model loaded. That is deliberate in routes.py: before the
+            # first training run /rank answers 503 and the feed drops to the `unranked` rung,
+            # which is a working system. Failing readiness here would instead make a normal
+            # cold start look like an outage.
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 384Mi
+            limits:
+              # A LightGBM booster is a few megabytes — unlike the FAISS index, a second copy
+              # costs nothing, which is why this image runs 2 uvicorn workers and this
+              # Deployment can scale out freely.
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: mlflow
+          persistentVolumeClaim:
+            claimName: mlflow-store
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ranking-service
+  labels:
+    app.kubernetes.io/name: ranking-service
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ranking-service
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

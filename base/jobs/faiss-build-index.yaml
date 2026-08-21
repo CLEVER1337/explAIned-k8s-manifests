@@ -1,0 +1,81 @@
+# Rebuilds the FAISS artifact from rec:article_embedding:* and writes it to the shared volume.
+#
+# Runs from the *service* image, not the ml-jobs one. That is not an accident: builder and
+# server live in the same repo because they share the binary format and the faiss version, and
+# an index written by a different faiss than the one that will mmap it is a silent corruption.
+# Whatever tag faiss-service runs, this must run too.
+#
+# The handoff is the manifest file. The job writes a new version directory, then rewrites
+# manifest.json atomically; the service polls it every RELOAD_WATCH_SECONDS and swaps the index
+# in process. Nothing restarts, and there is no window where the service reads a half-written
+# directory — which is why this is the only pod that mounts the volume writable.
+#
+# Same exit-code contract as the ml jobs: 0 built, 1 nothing to index (existing manifest left
+# alone), 2 Redis failed. 1 is mapped to success below — an empty Redis on a fresh cluster is
+# an expected state, not a failed job.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: faiss-build-index
+  labels:
+    app.kubernetes.io/name: faiss-build-index
+    app.kubernetes.io/component: job
+spec:
+  # Ten minutes behind ml-embeddings, which is what fills rec:article_embedding:*. Running
+  # them together would index whatever the previous half-hour left behind.
+  schedule: "10,40 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: faiss-build-index
+            app.kubernetes.io/component: job
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: build-index
+              image: explained/faiss-service
+              command:
+                - /bin/sh
+                - -c
+                - 'python -m explained_faiss.jobs.build_index; c=$?; [ $c -eq 1 ] && exit 0; exit $c'
+              envFrom:
+                - configMapRef:
+                    name: explained-endpoints
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-redis
+                      key: REDIS_PASSWORD
+                - name: REDIS_URL
+                  value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0
+                - name: INDEX_DIR
+                  value: /var/lib/explained-faiss
+                - name: EMBEDDING_DIM
+                  value: "384"
+                # Three versions on disk. Enough to roll back to a known-good index by editing
+                # manifest.json; not so many that the volume fills with stale copies.
+                - name: KEEP_VERSIONS
+                  value: "3"
+              volumeMounts:
+                - name: index
+                  mountPath: /var/lib/explained-faiss
+              resources:
+                requests:
+                  cpu: 500m
+                  # The build holds every vector in memory at once (np.vstack over the full
+                  # corpus) before it writes anything, so this scales with article count.
+                  memory: 1Gi
+                limits:
+                  memory: 3Gi
+          volumes:
+            - name: index
+              persistentVolumeClaim:
+                claimName: faiss-index

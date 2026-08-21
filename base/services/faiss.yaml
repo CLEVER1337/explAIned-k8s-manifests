@@ -1,0 +1,121 @@
+# Content-similarity search over article embeddings. Two properties drive this manifest:
+#
+#  1. The index lives in process memory. The Dockerfile runs uvicorn with --workers 1 for
+#     exactly that reason — a second worker is a second full copy of the index. The same logic
+#     applies one level up: every replica here holds its own copy, so memory scales linearly
+#     with replicas, not with traffic. Scale up only when p99 says to.
+#  2. Vectors never cross the language boundary. This service reads
+#     rec:user_embedding:{uid} out of Redis itself and answers with ids and scores, so the
+#     C# side never handles a float array. That is why it needs Redis credentials at all.
+#
+# The volume is read-only: writes belong to the build-index CronJob. The service notices a new
+# manifest.json within RELOAD_WATCH_SECONDS and swaps the index in place — no restart, and no
+# reason for this pod to ever hold the volume writable.
+apiVersion: v1
+kind: Service
+metadata:
+  name: faiss-service
+  labels:
+    app.kubernetes.io/name: faiss-service
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    app.kubernetes.io/name: faiss-service
+  ports:
+    - name: http
+      port: 8001
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: faiss-service
+  labels:
+    app.kubernetes.io/name: faiss-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: faiss-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: faiss-service
+        app.kubernetes.io/component: api
+        explained.io/service: faiss
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: faiss-service
+          image: explained/faiss-service
+          ports:
+            - name: http
+              containerPort: 8001
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-redis
+                  key: REDIS_PASSWORD
+            # pydantic-settings reads flat uppercase names — REDIS_URL binds to
+            # Settings.redis_url. Note this is a URL, so a password containing @ : / or #
+            # has to be percent-encoded before it goes in the Secret.
+            - name: REDIS_URL
+              value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0
+            - name: INDEX_DIR
+              value: /var/lib/explained-faiss
+            # 384 is not a tunable. It is fixed by paraphrase-multilingual-MiniLM-L12-v2 and
+            # has to match EMBEDDING_DIM in explAIned-ml; a mismatch produces an index that
+            # loads fine and returns nonsense.
+            - name: EMBEDDING_DIM
+              value: "384"
+            - name: DEFAULT_TOP_K
+              value: "200"
+            - name: RELOAD_WATCH_SECONDS
+              value: "60"
+          volumeMounts:
+            - name: index
+              mountPath: /var/lib/explained-faiss
+              readOnly: true
+          readinessProbe:
+            # /health reports whether an index is loaded. Before the first build-index run
+            # there is none and /search answers 503 — which is a legitimate state, not a
+            # broken pod, so this probe is allowed a long runway rather than a hard gate.
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              # An IndexFlatIP(384) is 1.5 KB per article held flat in RAM — ~150 MB at
+              # 100k articles, on top of the interpreter. Raise the limit with the corpus,
+              # not with traffic.
+              memory: 512Mi
+            limits:
+              memory: 1536Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: index
+          persistentVolumeClaim:
+            claimName: faiss-index
+            readOnly: true

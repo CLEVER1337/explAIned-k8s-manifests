@@ -1,0 +1,136 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: identity-service
+  labels:
+    app.kubernetes.io/name: identity-service
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    app.kubernetes.io/name: identity-service
+  ports:
+    - name: http
+      port: 5125
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: identity-service
+  labels:
+    app.kubernetes.io/name: identity-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: identity-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: identity-service
+        app.kubernetes.io/component: api
+        explained.io/service: identity
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5125"
+        prometheus.io/path: /metrics
+    spec:
+      initContainers:
+        # Migrations run inside Program.cs (db.Database.Migrate()) before the host starts
+        # listening, so a pod that comes up before PostgreSQL does not retry — it throws and
+        # dies. Kubernetes would eventually back off into a working state, but only after
+        # painting the namespace with CrashLoopBackOff. Waiting here is cheaper to read.
+        - name: wait-for-postgres
+          image: postgres:17-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER"; do sleep 2; done
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+      containers:
+        - name: identity-service
+          image: explained/identity-service
+          ports:
+            - name: http
+              containerPort: 5125
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: Production
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-postgres
+                  key: POSTGRES_PASSWORD
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-redis
+                  key: REDIS_PASSWORD
+            # Composed here rather than stored whole in a Secret: only the password is
+            # sensitive, and $(VAR) resolves against envFrom values too.
+            - name: ConnectionStrings__PostgreSQL
+              value: Host=$(POSTGRES_HOST);Port=$(POSTGRES_PORT);Database=asd;Username=$(POSTGRES_USER);Password=$(POSTGRES_PASSWORD)
+            - name: ConnectionStrings__Redis
+              value: $(REDIS_HOST):$(REDIS_PORT),password=$(REDIS_PASSWORD),abortConnect=false
+            # This service mints the tokens the other four validate. Key, issuer and audience
+            # come from the same ConfigMap and Secret everywhere, which is the only thing
+            # keeping them in agreement.
+            - name: Jwt__Key
+              valueFrom:
+                secretKeyRef:
+                  name: explained-jwt
+                  key: JWT_KEY
+            - name: Jwt__Issuer
+              value: $(JWT_ISSUER)
+            - name: Jwt__Audience
+              value: $(JWT_AUDIENCE)
+          # No /health endpoint exists in any of the .NET services, so /metrics stands in: it
+          # is unauthenticated, it is served by the same Kestrel pipeline a real request goes
+          # through, and prometheus-net registers it at startup. It proves the process is
+          # serving; it does not prove PostgreSQL is reachable. Adding AddHealthChecks() with
+          # a DbContext check is the follow-up worth doing — see the README.
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # readOnlyRootFilesystem, so the one path .NET actually writes to gets an emptyDir.
+            #
+            # The data-protection key ring lands in here too, which means it is per-pod and
+            # dies with the pod. JWTs are unaffected — they are signed with the symmetric
+            # Jwt:Key, not with data protection — but anything ASP.NET Identity protects
+            # (email-confirmation and password-reset tokens) is only valid on the pod that
+            # issued it. Persist the ring to Redis or a shared volume before shipping those
+            # flows; see the README.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

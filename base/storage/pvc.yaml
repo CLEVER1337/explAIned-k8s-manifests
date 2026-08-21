@@ -1,0 +1,40 @@
+# Two volumes are shared between a writer (a CronJob) and a reader (a Deployment), which is the
+# only reason ReadWriteMany appears in this repo at all.
+#
+#   faiss-index   build-index CronJob writes a new version directory + manifest.json;
+#                 the :8001 service watches the manifest and swaps the index in process.
+#   mlflow-store  train-lightgbm writes the SQLite tracking DB and the artifacts;
+#                 the :8002 ranking service resolves the `champion` alias out of it at startup.
+#
+# RWX needs a StorageClass that can provide it (NFS, CephFS, Longhorn, EFS...). On a
+# single-node cluster (kind / minikube / k3s local-path) RWX "works" only because every pod
+# lands on the same node — fine for dev, not something to rely on in prod. The prod overlay
+# is where you either point these at a real RWX class or replace them outright: swap the
+# faiss volume for an object-store sync sidecar and MLflow for a tracking server.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: faiss-index
+  labels:
+    app.kubernetes.io/name: faiss-index
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mlflow-store
+  labels:
+    app.kubernetes.io/name: mlflow-store
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi

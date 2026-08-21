@@ -1,0 +1,192 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Multi-node, real storage, real hostnames, real secrets.
+#
+# This overlay does not build without secrets/*.env, and those files are gitignored. That is
+# the point: `kustomize build overlays/prod` failing with "file not found" is a better outcome
+# than it succeeding with a default password. overlays/prod/README.md covers both ways to
+# supply them.
+namespace: explained
+
+resources:
+  - ../../base
+
+secretGenerator:
+  - name: explained-postgres
+    envs:
+      - secrets/postgres.env
+  - name: explained-redis
+    envs:
+      - secrets/redis.env
+  - name: explained-elasticsearch
+    envs:
+      - secrets/elasticsearch.env
+  - name: explained-jwt
+    envs:
+      - secrets/jwt.env
+  - name: explained-grafana
+    envs:
+      - secrets/grafana.env
+
+replicas:
+  - name: identity-service
+    count: 2
+  - name: comment-service
+    count: 3
+  - name: profile-service
+    count: 3
+  - name: recommendation-service
+    count: 3
+  - name: ranking-service
+    count: 3
+  # article-service is deliberately absent: its replica count is the article-service-indexer
+  # consumer group size, and the HPA in base owns it between 2 and the topic's 3 partitions.
+  # Pinning it here would fight the autoscaler.
+
+patches:
+  # ── Public identity ──────────────────────────────────────────────────────────────────
+  # Jwt:Issuer and Jwt:Audience are compared as strings by every validating service, so
+  # changing them invalidates every token already issued. Do it during a deploy window, not
+  # as a drive-by edit.
+  - target:
+      kind: ConfigMap
+      name: explained-endpoints
+    patch: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: explained-endpoints
+      data:
+        JWT_ISSUER: https://api.explained.example/
+        JWT_AUDIENCE: https://api.explained.example/
+
+  - target:
+      kind: Ingress
+      name: explained-api
+    patch: |
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: explained-api
+        annotations:
+          cert-manager.io/cluster-issuer: letsencrypt-prod
+          nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+      spec:
+        tls:
+          - hosts:
+              - api.explained.example
+            secretName: explained-api-tls
+    # The host itself lives in a JSON patch because a strategic merge on a list of rules
+    # appends rather than replaces — merging the block above would leave the .local rule in
+    # place next to the real one.
+  - target:
+      kind: Ingress
+      name: explained-api
+    patch: |
+      - op: replace
+        path: /spec/rules/0/host
+        value: api.explained.example
+  - target:
+      kind: Ingress
+      name: explained-grafana
+    patch: |
+      - op: replace
+        path: /spec/rules/0/host
+        value: grafana.explained.example
+
+  - target:
+      kind: Deployment
+      name: grafana
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: grafana
+      spec:
+        template:
+          spec:
+            containers:
+              - name: grafana
+                env:
+                  - name: GF_SERVER_ROOT_URL
+                    value: https://grafana.explained.example/
+
+  # ── Storage ──────────────────────────────────────────────────────────────────────────
+  # The two shared volumes need a StorageClass that actually provides ReadWriteMany. Name
+  # yours here. If you have none, this is the point at which to replace the mechanism rather
+  # than the class — an object-store sync sidecar for the FAISS index, and a real MLflow
+  # tracking server instead of SQLite on a shared filesystem.
+  - target:
+      kind: PersistentVolumeClaim
+      name: faiss-index|mlflow-store
+    patch: |
+      - op: add
+        path: /spec/storageClassName
+        value: REPLACE-ME-rwx-storageclass
+
+  # ── Elasticsearch ────────────────────────────────────────────────────────────────────
+  # Most managed node images already set vm.max_map_count, and a privileged init container is
+  # the first thing a `restricted` Pod Security policy rejects. Drop it — and if your nodes
+  # do not set it, fix that on the node, not in the pod.
+  - target:
+      kind: StatefulSet
+      name: elasticsearch
+    patch: |
+      - op: remove
+        path: /spec/template/spec/initContainers
+
+  - target:
+      kind: StatefulSet
+      name: elasticsearch
+    patch: |
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: elasticsearch
+      spec:
+        template:
+          spec:
+            containers:
+              - name: elasticsearch
+                env:
+                  - name: ES_JAVA_OPTS
+                    value: -Xms2g -Xmx2g
+                resources:
+                  requests:
+                    cpu: "1"
+                    memory: 5Gi
+                  limits:
+                    # Twice the heap, so Lucene gets the other half for its file cache.
+                    memory: 6Gi
+
+# Digests, not tags. `:v1.4.0` is a label someone can move; a digest is the image. Point these
+# at your registry and let CI rewrite them — `kustomize edit set image` does it in place.
+images:
+  - name: explained/identity-service
+    newName: registry.example.com/explained/identity-service
+    newTag: REPLACE-ME
+  - name: explained/article-service
+    newName: registry.example.com/explained/article-service
+    newTag: REPLACE-ME
+  - name: explained/comment-service
+    newName: registry.example.com/explained/comment-service
+    newTag: REPLACE-ME
+  - name: explained/profile-service
+    newName: registry.example.com/explained/profile-service
+    newTag: REPLACE-ME
+  - name: explained/recommendation-service
+    newName: registry.example.com/explained/recommendation-service
+    newTag: REPLACE-ME
+  - name: explained/event-consumer-service
+    newName: registry.example.com/explained/event-consumer-service
+    newTag: REPLACE-ME
+  - name: explained/faiss-service
+    newName: registry.example.com/explained/faiss-service
+    newTag: REPLACE-ME
+  - name: explained/ranking-service
+    newName: registry.example.com/explained/ranking-service
+    newTag: REPLACE-ME
+  - name: explained/ml-jobs
+    newName: registry.example.com/explained/ml-jobs
+    newTag: REPLACE-ME

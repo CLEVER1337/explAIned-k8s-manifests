@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+  - name: explained
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: true
+    # The dashboards come from a ConfigMap, so the running instance is not where they are
+    # edited — a change made in the UI is gone at the next rollout. Edit the JSON in
+    # base/monitoring/files/ and redeploy.
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

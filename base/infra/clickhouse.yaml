@@ -1,0 +1,146 @@
+# ClickHouse holds everything analytical: `explained.user_events` (written by the Kafka sink)
+# and `explained.feed_impressions` (written by :5056). Nothing on the request path reads it —
+# the offline jobs do, hourly at most — so a single node with one volume is the right size.
+#
+# The database name is lowercase. ClickHouse identifiers are case-sensitive and every consumer
+# in the repo says `explained`; `explAIned` silently swallows inserts.
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  labels:
+    app.kubernetes.io/name: clickhouse
+    app.kubernetes.io/component: analytics
+spec:
+  selector:
+    app.kubernetes.io/name: clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: http
+    - name: native
+      port: 9000
+      targetPort: native
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  labels:
+    app.kubernetes.io/name: clickhouse
+    app.kubernetes.io/component: analytics
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: clickhouse
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clickhouse
+        app.kubernetes.io/component: analytics
+    spec:
+      securityContext:
+        fsGroup: 101
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:25.3-alpine
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          env:
+            # Both writers connect as `default` with no password (see the ClickHouse
+            # connection strings in the consumer and in explAIned-ml's config). Giving this a
+            # password means changing it in three places at once, so the prod overlay does it
+            # deliberately rather than the base doing it halfway.
+            - name: CLICKHOUSE_USER
+              value: default
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# The consumer service does not create its own schema — it assumes the tables exist and an
+# insert against a missing table just fails. This Job is that assumption made explicit.
+#
+# schema.sql is verbatim from explAInedArticleEventConsumerService/schema.sql and every
+# statement in it is IF NOT EXISTS, so re-running is free. It goes through clickhouse-client
+# rather than curl because the HTTP interface rejects multi-statement bodies.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: clickhouse-schema
+  labels:
+    app.kubernetes.io/name: clickhouse-schema
+    app.kubernetes.io/component: bootstrap
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clickhouse-schema
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: apply-schema
+          image: clickhouse/clickhouse-server:25.3-alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              for i in $(seq 1 60); do
+                if clickhouse-client --host clickhouse --query 'SELECT 1' >/dev/null 2>&1; then
+                  break
+                fi
+                echo "waiting for clickhouse ($i/60)"
+                sleep 5
+              done
+              clickhouse-client --host clickhouse --queries-file /schema/clickhouse-schema.sql
+              clickhouse-client --host clickhouse --query 'SHOW TABLES FROM explained'
+          volumeMounts:
+            - name: schema
+              mountPath: /schema
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: schema
+          configMap:
+            name: clickhouse-schema-sql

@@ -1,0 +1,58 @@
+# The docker-compose version of this file listed eight static targets on localhost. That list
+# was a maintenance liability even then; under an HPA it is simply wrong, because the thing
+# being scraped is a pod and pods come and go.
+#
+# So: one job, pod service discovery, and the pods opt in via annotations —
+#
+#     prometheus.io/scrape: "true"
+#     prometheus.io/port:   "5036"
+#     prometheus.io/path:   /metrics
+#
+# and carry the label `explained.io/service`, which is relabelled to `service` below. That
+# label is the compatibility bridge: every panel in microservices.json and every alert in
+# recommendations.yml selects on service="article", service="faiss" and so on, so the queries
+# carry over from the compose setup untouched.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: explained-pods
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          # Scoped to wherever this Prometheus runs, which is what lets the RBAC below be a
+          # namespaced Role instead of a ClusterRole. Deploying the stack twice gives each
+          # copy its own Prometheus watching only itself.
+          own_namespace: true
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      # Discovery hands over the pod IP with the first container port. Swap in the annotated
+      # port so a pod exposing several ports is still scraped on the right one.
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_label_explained_io_service]
+        action: replace
+        target_label: service
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod

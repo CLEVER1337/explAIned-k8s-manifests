@@ -1,0 +1,10 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # In-cluster Service, not localhost — the compose stack ran both on the host network.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

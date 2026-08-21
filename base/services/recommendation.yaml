@@ -1,0 +1,175 @@
+# The feed orchestrator. No database of its own — Redis directly (prefix `rec:`, not the
+# `explAIned_` one the caches use) plus HTTP to articles, FAISS and ranking.
+#
+# Its whole design is a degradation ladder — personalized → partial → unranked → trending →
+# recent → cached → empty — and it never answers 5xx. That has a direct consequence for this
+# manifest: **the dependencies below are all optional at runtime**. FAISS down means one rung
+# lower, not an error, and the pod stays Ready throughout. So there are no wait-for init
+# containers here and no readiness gate on Redis; a probe that failed when a candidate source
+# was missing would take the service down to prevent a degradation it is built to absorb.
+#
+# The corollary is that a misconfigured URL here is silent. Watch the `source` and `rung`
+# labels on the feed metrics, not the pod status — monitoring/files/recommendations.yml has
+# the alerts for it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: recommendation-service
+  labels:
+    app.kubernetes.io/name: recommendation-service
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    app.kubernetes.io/name: recommendation-service
+  ports:
+    - name: http
+      port: 5056
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recommendation-service
+  labels:
+    app.kubernetes.io/name: recommendation-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: recommendation-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: recommendation-service
+        app.kubernetes.io/component: api
+        explained.io/service: recommendation
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5056"
+        prometheus.io/path: /metrics
+    spec:
+      # ClickHouseImpressionLog batches impressions and flushes every 2s. Long enough for the
+      # last batch to land instead of being dropped on SIGTERM.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: recommendation-service
+          image: explained/recommendation-service
+          ports:
+            - name: http
+              containerPort: 5056
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: Production
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-redis
+                  key: REDIS_PASSWORD
+            # The three aggressive timeouts are not tuning, they are the contract: the feed has
+            # a 300 ms total budget and a Redis call that blocks for a second has already blown
+            # it. Failing fast is what lets the ladder drop a rung instead of timing out.
+            - name: ConnectionStrings__Redis
+              value: $(REDIS_HOST):$(REDIS_PORT),password=$(REDIS_PASSWORD),abortConnect=false,connectTimeout=200,syncTimeout=200,asyncTimeout=200
+            - name: Cache__Provider
+              value: Redis
+            - name: Articles__BaseUrl
+              value: $(ARTICLES_BASE_URL)
+            - name: Faiss__Enabled
+              value: "true"
+            - name: Faiss__BaseUrl
+              value: $(FAISS_BASE_URL)
+            - name: Ranking__Enabled
+              value: "true"
+            - name: Ranking__BaseUrl
+              value: $(RANKING_BASE_URL)
+            - name: Als__Enabled
+              value: "true"
+            - name: ClickHouse__Enabled
+              value: "true"
+            - name: ClickHouse__BaseUrl
+              value: $(CLICKHOUSE_URL)
+            - name: ClickHouse__Database
+              value: $(CLICKHOUSE_DATABASE)
+            - name: ClickHouse__ImpressionsTable
+              value: feed_impressions
+            - name: ClickHouse__BatchSize
+              value: "200"
+            - name: ClickHouse__FlushMs
+              value: "2000"
+            - name: Jwt__Key
+              valueFrom:
+                secretKeyRef:
+                  name: explained-jwt
+                  key: JWT_KEY
+            - name: Jwt__Issuer
+              value: $(JWT_ISSUER)
+            - name: Jwt__Audience
+              value: $(JWT_AUDIENCE)
+          volumeMounts:
+            # subPath, so this replaces the single file instead of mounting over /app and
+            # hiding the DLLs next to it. The trade-off is that subPath mounts do not update
+            # in place — but the ConfigMap is generated with a content hash, so editing it
+            # renames it and rolls the Deployment anyway.
+            - name: appsettings
+              mountPath: /app/appsettings.json
+              subPath: appsettings.json
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: appsettings
+          configMap:
+            name: recommendation-appsettings
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: recommendation-service
+  labels:
+    app.kubernetes.io/name: recommendation-service
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: recommendation-service
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

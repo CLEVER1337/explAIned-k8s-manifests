@@ -1,0 +1,148 @@
+# Produces `ArticleCommented` to user.events on the create path only, fire-and-forget: the
+# producer swallows Kafka failures and logs a warning, so this pod stays healthy and useful
+# even with the broker down. Nothing here consumes, so replicas are free — no consumer group,
+# no rebalance, no partition ceiling.
+apiVersion: v1
+kind: Service
+metadata:
+  name: comment-service
+  labels:
+    app.kubernetes.io/name: comment-service
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    app.kubernetes.io/name: comment-service
+  ports:
+    - name: http
+      port: 5046
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comment-service
+  labels:
+    app.kubernetes.io/name: comment-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: comment-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: comment-service
+        app.kubernetes.io/component: api
+        explained.io/service: comment
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5046"
+        prometheus.io/path: /metrics
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:17-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER"; do sleep 2; done
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+      containers:
+        - name: comment-service
+          image: explained/comment-service
+          ports:
+            - name: http
+              containerPort: 5046
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: Production
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-postgres
+                  key: POSTGRES_PASSWORD
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-redis
+                  key: REDIS_PASSWORD
+            - name: ConnectionStrings__PostgreSQL
+              value: Host=$(POSTGRES_HOST);Port=$(POSTGRES_PORT);Database=comments;Username=$(POSTGRES_USER);Password=$(POSTGRES_PASSWORD)
+            - name: ConnectionStrings__Redis
+              value: $(REDIS_HOST):$(REDIS_PORT),password=$(REDIS_PASSWORD),abortConnect=false
+            - name: Database__Provider
+              value: Postgres
+            - name: Cache__Provider
+              value: Redis
+            - name: Kafka__BootstrapServers
+              value: $(KAFKA_BOOTSTRAP_SERVERS)
+            - name: Kafka__UserEventsTopic
+              value: $(KAFKA_USER_EVENTS_TOPIC)
+            - name: Jwt__Key
+              valueFrom:
+                secretKeyRef:
+                  name: explained-jwt
+                  key: JWT_KEY
+            - name: Jwt__Issuer
+              value: $(JWT_ISSUER)
+            - name: Jwt__Audience
+              value: $(JWT_AUDIENCE)
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: comment-service
+  labels:
+    app.kubernetes.io/name: comment-service
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: comment-service
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

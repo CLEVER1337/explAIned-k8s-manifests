@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "This file replaces /app/appsettings.json in the recommendation service container, and it",
+    "is deliberately smaller than the one in the image.",
+    "",
+    "explAInedRecommendationService/Program.cs calls builder.Configuration.AddJsonFile(",
+    "\"appsettings.json\") on line 9. CreateBuilder has already loaded that file; adding it a",
+    "second time appends it as the last provider, and the last provider wins. Environment",
+    "variables are registered before it, so every key this file defines is a key no",
+    "ConnectionStrings__Redis or Jwt__Key env var can override.",
+    "",
+    "The fix is to keep only what is genuinely static — log levels and the feed's latency",
+    "budget — and delete every addressable setting from it. What is not here cannot shadow",
+    "anything, so the Deployment supplies Redis, the upstream URLs and the JWT stanza as",
+    "ordinary env vars, exactly like the other four services.",
+    "",
+    "Deleting that AddJsonFile line in Program.cs makes this whole file unnecessary."
+  ],
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+  "Feed": {
+    "DefaultLimit": 20,
+    "MaxLimit": 50,
+    "CandidatePoolSize": 200,
+    "TotalBudgetMs": 300,
+    "SourceDeadlineMs": 120,
+    "RankerDeadlineMs": 120,
+    "ArticleDeadlineMs": 150,
+    "FeedCacheTtlSeconds": 300,
+    "SnapshotMaxAgeHours": 24
+  }
+}

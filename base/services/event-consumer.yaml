@@ -1,0 +1,120 @@
+# user.events → ClickHouse sink, plus the `rec:user_viewed:*` sets the recommendation loop
+# reads to exclude what a user has already seen.
+#
+# Three things shape this manifest:
+#
+#  1. It is a consumer, not a server. The HTTP surface is incidental (an MVC default route),
+#     there is no /metrics, and Program.cs calls UseHttpsRedirection with no HTTPS port
+#     configured — so an httpGet probe is the wrong instrument. TCP on 5259 is what is left.
+#  2. Replicas are consumers in one group. user.events has 3 partitions, so 3 is the ceiling,
+#     and there is no HPA: a sink that scales itself is a sink that rebalances under load.
+#  3. Offsets are committed only after the ClickHouse insert acknowledges. A pod killed
+#     mid-batch replays those events, and ReplacingMergeTree on event_id collapses the
+#     duplicates. At-most-once on the produce side, at-least-once here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: event-consumer-service
+  labels:
+    app.kubernetes.io/name: event-consumer-service
+    app.kubernetes.io/component: worker
+spec:
+  selector:
+    app.kubernetes.io/name: event-consumer-service
+  ports:
+    - name: http
+      port: 5259
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-consumer-service
+  labels:
+    app.kubernetes.io/name: event-consumer-service
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: event-consumer-service
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: event-consumer-service
+        app.kubernetes.io/component: worker
+        explained.io/service: event-consumer
+    spec:
+      # InsertDelayMs is 10s: the buffer flushes on that timer or at 100 events. Anything
+      # shorter than the timer here throws away a partial batch on every rollout.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: event-consumer-service
+          image: explained/event-consumer-service
+          ports:
+            - name: http
+              containerPort: 5259
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: Production
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-redis
+                  key: REDIS_PASSWORD
+            - name: ConnectionStrings__Redis
+              value: $(REDIS_HOST):$(REDIS_PORT),password=$(REDIS_PASSWORD),abortConnect=false
+            # ClickHouse.Driver over the HTTP interface on 8123, user `default`, no password.
+            - name: ConnectionStrings__ClickHouse
+              value: Host=clickhouse;Port=8123;Database=$(CLICKHOUSE_DATABASE);User=default
+            - name: Kafka__BootstrapServers
+              value: $(KAFKA_BOOTSTRAP_SERVERS)
+            - name: Kafka__Topic
+              value: $(KAFKA_USER_EVENTS_TOPIC)
+            - name: Kafka__GroupId
+              value: explAInedArticleEventConsumerService
+          volumeMounts:
+            - name: appsettings
+              mountPath: /app/appsettings.json
+              subPath: appsettings.json
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            # Deliberately weak: this only says Kestrel is up, not that the consumer is
+            # keeping up. Lag is the real signal — watch the `explAInedArticleEventConsumerService`
+            # consumer group, not this probe.
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: appsettings
+          configMap:
+            name: event-consumer-appsettings
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,122 @@
+# One PostgreSQL instance, four databases — the same shape the services already expect
+# (`asd`, `articles`, `comments`, `profiles`). Each service still owns its own database and
+# still reaches the others only over HTTP; sharing a server is a packaging decision, not an
+# architectural one. Splitting into four StatefulSets later means changing POSTGRES_HOST per
+# service and nothing else.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-initdb
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+data:
+  # Runs once, on an empty data directory only. An existing volume is left alone, so this is
+  # not a migration path — new databases for new services have to be created by hand or by a
+  # Job against a live cluster.
+  10-databases.sql: |
+    CREATE DATABASE asd;
+    CREATE DATABASE articles;
+    CREATE DATABASE comments;
+    CREATE DATABASE profiles;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  # Headless: there is exactly one writer and clients should resolve straight to the pod, so
+  # a connection cannot be silently load-balanced onto a replica that does not exist yet.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: explained-endpoints
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-postgres
+                  key: POSTGRES_PASSWORD
+            # The four real databases come from initdb; this one only stops the entrypoint
+            # from creating a database named after the superuser.
+            - name: POSTGRES_DB
+              value: postgres
+            # A subdirectory, not the mount root: the volume comes with a lost+found on most
+            # provisioners and initdb refuses to run in a non-empty directory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: initdb
+          configMap:
+            name: postgres-initdb
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

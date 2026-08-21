@@ -1,0 +1,158 @@
+# Fans out to the article and comment services for /profiles/{id}/articles and /comments, and
+# is contractually forbidden from returning 5xx when they fail — an upstream timeout becomes
+# `{items: [], degraded: true}`. So the upstream URLs here are a soft dependency: getting them
+# wrong degrades the response instead of breaking the pod, which means a typo is invisible
+# until someone reads `degraded`. They come from the shared ConfigMap for exactly that reason.
+#
+# Avatar bytes live in PostgreSQL, not on disk, so this stays stateless and takes no volume.
+apiVersion: v1
+kind: Service
+metadata:
+  name: profile-service
+  labels:
+    app.kubernetes.io/name: profile-service
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    app.kubernetes.io/name: profile-service
+  ports:
+    - name: http
+      port: 5066
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: profile-service
+  labels:
+    app.kubernetes.io/name: profile-service
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: profile-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: profile-service
+        app.kubernetes.io/component: api
+        explained.io/service: profile
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5066"
+        prometheus.io/path: /metrics
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:17-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER"; do sleep 2; done
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+      containers:
+        - name: profile-service
+          image: explained/profile-service
+          ports:
+            - name: http
+              containerPort: 5066
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: Production
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-postgres
+                  key: POSTGRES_PASSWORD
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-redis
+                  key: REDIS_PASSWORD
+            - name: ConnectionStrings__PostgreSQL
+              value: Host=$(POSTGRES_HOST);Port=$(POSTGRES_PORT);Database=profiles;Username=$(POSTGRES_USER);Password=$(POSTGRES_PASSWORD)
+            - name: ConnectionStrings__Redis
+              value: $(REDIS_HOST):$(REDIS_PORT),password=$(REDIS_PASSWORD),abortConnect=false
+            - name: Database__Provider
+              value: Postgres
+            - name: Cache__Provider
+              value: Redis
+            - name: Upstreams__ArticlesBaseUrl
+              value: $(ARTICLES_BASE_URL)
+            - name: Upstreams__CommentsBaseUrl
+              value: $(COMMENTS_BASE_URL)
+            - name: Upstreams__TimeoutSeconds
+              value: "5"
+            - name: Avatar__MaxBytes
+              value: "1048576"
+            - name: Jwt__Key
+              valueFrom:
+                secretKeyRef:
+                  name: explained-jwt
+                  key: JWT_KEY
+            - name: Jwt__Issuer
+              value: $(JWT_ISSUER)
+            - name: Jwt__Audience
+              value: $(JWT_AUDIENCE)
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              # Avatars are read out of PostgreSQL and buffered in memory before they go back
+              # over the wire; Avatar:MaxBytes caps each at 1 MiB, so concurrency is what sets
+              # the ceiling here, not any single request.
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: profile-service
+  labels:
+    app.kubernetes.io/name: profile-service
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: profile-service
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
