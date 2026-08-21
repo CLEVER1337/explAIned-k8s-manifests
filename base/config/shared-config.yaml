@@ -3,12 +3,13 @@
 # Every workload pulls this in with `envFrom`, then composes the shape its own runtime wants
 # out of the pieces — `ConnectionStrings__PostgreSQL` for .NET, `REDIS_URL` for Python. The
 # kubelet expands $(VAR) in an `env` entry against everything already in scope, envFrom
-# included, so the composition happens in the manifest and the secret never has to carry a
+# included, so the composition happens in the manifest and the Secret never has to carry a
 # whole connection string just to hide one password.
 #
-# Service DNS names are short on purpose: they resolve inside whatever namespace this is
-# applied to, so an overlay can stand a second copy of the stack up next to the first without
-# editing a single value here.
+# The values here are the in-cluster defaults: short Service names that resolve inside whatever
+# namespace this is applied to. They are what the `self-hosted-databases` component provides.
+# An overlay whose databases live elsewhere — as they do in the homelab, on VMs of their own —
+# patches the four host/URL/user keys and nothing else changes.
 #
 # This one ConfigMap is hand-written instead of generated, so that it can carry these comments.
 # The cost is that it has no content hash in its name: editing a value here updates the
@@ -32,13 +33,20 @@ data:
   KAFKA_ARTICLES_TOPIC: articles.events
   KAFKA_USER_EVENTS_TOPIC: user.events
 
-  # http, not https: TLS is terminated at the ingress and the article service talks to ES over
-  # the pod network. The client-side `ServerCertificateValidationCallback => true` in
-  # Program.cs stops mattering the moment there is no certificate to not-validate.
+  # http, not https: TLS is terminated at the edge and the article service talks to ES over a
+  # private network either way. The client-side `ServerCertificateValidationCallback => true`
+  # in Program.cs stops mattering the moment there is no certificate to not-validate.
   ELASTICSEARCH_URL: http://elasticsearch:9200
   ELASTICSEARCH_USERNAME: elastic
 
+  # Both forms, because the two clients want different things: the .NET services and the
+  # Python jobs speak HTTP on 8123, and the schema Job uses clickhouse-client on the native
+  # port and wants a bare host.
+  CLICKHOUSE_HOST: clickhouse
   CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: default
+  # Lowercase, and not negotiable: ClickHouse identifiers are case-sensitive, schema.sql
+  # writes `explained.user_events`, and `explAIned` silently swallows every insert.
   CLICKHOUSE_DATABASE: explained
 
   # One issuer/audience string, one place. Identity mints tokens with these and the other four

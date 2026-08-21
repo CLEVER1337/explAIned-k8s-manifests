@@ -69,11 +69,18 @@ spec:
                 secretKeyRef:
                   name: explained-redis
                   key: REDIS_PASSWORD
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-clickhouse
+                  key: CLICKHOUSE_PASSWORD
             - name: ConnectionStrings__Redis
               value: $(REDIS_HOST):$(REDIS_PORT),password=$(REDIS_PASSWORD),abortConnect=false
-            # ClickHouse.Driver over the HTTP interface on 8123, user `default`, no password.
+            # ClickHouse.Driver over the HTTP interface on 8123. `default` with an empty
+            # password in-cluster; a real account with a real password anywhere the server is
+            # shared, which is why both come from the environment rather than being assumed.
             - name: ConnectionStrings__ClickHouse
-              value: Host=clickhouse;Port=8123;Database=$(CLICKHOUSE_DATABASE);User=default
+              value: Host=$(CLICKHOUSE_HOST);Port=8123;Database=$(CLICKHOUSE_DATABASE);User=$(CLICKHOUSE_USER);Password=$(CLICKHOUSE_PASSWORD)
             - name: Kafka__BootstrapServers
               value: $(KAFKA_BOOTSTRAP_SERVERS)
             - name: Kafka__Topic

@@ -72,6 +72,13 @@ spec:
                   value: $(CLICKHOUSE_URL)
                 - name: CLICKHOUSE_DATABASE
                   value: $(CLICKHOUSE_DATABASE)
+                - name: CLICKHOUSE_USER
+                  value: $(CLICKHOUSE_USER)
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-clickhouse
+                      key: CLICKHOUSE_PASSWORD
                 - name: ARTICLES_BASE_URL
                   value: $(ARTICLES_BASE_URL)
                 # The weights are baked into the image at /opt/hf. Pointing HF_HOME anywhere
@@ -135,6 +142,13 @@ spec:
                   value: $(CLICKHOUSE_URL)
                 - name: CLICKHOUSE_DATABASE
                   value: $(CLICKHOUSE_DATABASE)
+                - name: CLICKHOUSE_USER
+                  value: $(CLICKHOUSE_USER)
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-clickhouse
+                      key: CLICKHOUSE_PASSWORD
                 - name: ARTICLES_BASE_URL
                   value: $(ARTICLES_BASE_URL)
               resources:
@@ -191,6 +205,13 @@ spec:
                   value: $(CLICKHOUSE_URL)
                 - name: CLICKHOUSE_DATABASE
                   value: $(CLICKHOUSE_DATABASE)
+                - name: CLICKHOUSE_USER
+                  value: $(CLICKHOUSE_USER)
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-clickhouse
+                      key: CLICKHOUSE_PASSWORD
               resources:
                 requests:
                   cpu: 500m
@@ -243,6 +264,13 @@ spec:
                   value: $(CLICKHOUSE_URL)
                 - name: CLICKHOUSE_DATABASE
                   value: $(CLICKHOUSE_DATABASE)
+                - name: CLICKHOUSE_USER
+                  value: $(CLICKHOUSE_USER)
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-clickhouse
+                      key: CLICKHOUSE_PASSWORD
                 - name: ARTICLES_BASE_URL
                   value: $(ARTICLES_BASE_URL)
               resources:
@@ -298,6 +326,13 @@ spec:
                   value: $(CLICKHOUSE_URL)
                 - name: CLICKHOUSE_DATABASE
                   value: $(CLICKHOUSE_DATABASE)
+                - name: CLICKHOUSE_USER
+                  value: $(CLICKHOUSE_USER)
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-clickhouse
+                      key: CLICKHOUSE_PASSWORD
                 # implicit spawns a thread per core by default and thrashes under a CPU limit.
                 # Pinning it to the request keeps the factorisation predictable.
                 - name: OPENBLAS_NUM_THREADS
@@ -355,6 +390,13 @@ spec:
                   value: $(CLICKHOUSE_URL)
                 - name: CLICKHOUSE_DATABASE
                   value: $(CLICKHOUSE_DATABASE)
+                - name: CLICKHOUSE_USER
+                  value: $(CLICKHOUSE_USER)
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: explained-clickhouse
+                      key: CLICKHOUSE_PASSWORD
                 # The one job that shares state with a running service: it writes the tracking
                 # DB and the artifacts that :8002 resolves `champion` out of. Same URIs as the
                 # ranking service, same volume — if these two disagree the model trains into a

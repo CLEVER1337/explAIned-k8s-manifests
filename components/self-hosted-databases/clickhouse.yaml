@@ -4,6 +4,11 @@
 #
 # The database name is lowercase. ClickHouse identifiers are case-sensitive and every consumer
 # in the repo says `explained`; `explAIned` silently swallows inserts.
+#
+# The tables are not created here — base/infra/clickhouse-schema.yaml owns that, because they
+# are needed wherever ClickHouse runs, VM included. This server is deliberately left with its
+# stock `default` account: no password, reachable from anywhere, which is fine for a laptop
+# cluster and is nothing like how the homelab's ClickHouse is configured.
 apiVersion: v1
 kind: Service
 metadata:
@@ -90,57 +95,3 @@ spec:
         resources:
           requests:
             storage: 20Gi
----
-# The consumer service does not create its own schema — it assumes the tables exist and an
-# insert against a missing table just fails. This Job is that assumption made explicit.
-#
-# schema.sql is verbatim from explAInedArticleEventConsumerService/schema.sql and every
-# statement in it is IF NOT EXISTS, so re-running is free. It goes through clickhouse-client
-# rather than curl because the HTTP interface rejects multi-statement bodies.
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: clickhouse-schema
-  labels:
-    app.kubernetes.io/name: clickhouse-schema
-    app.kubernetes.io/component: bootstrap
-spec:
-  backoffLimit: 10
-  ttlSecondsAfterFinished: 3600
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: clickhouse-schema
-        app.kubernetes.io/component: bootstrap
-    spec:
-      restartPolicy: OnFailure
-      containers:
-        - name: apply-schema
-          image: clickhouse/clickhouse-server:25.3-alpine
-          command:
-            - /bin/sh
-            - -c
-            - |
-              set -eu
-              for i in $(seq 1 60); do
-                if clickhouse-client --host clickhouse --query 'SELECT 1' >/dev/null 2>&1; then
-                  break
-                fi
-                echo "waiting for clickhouse ($i/60)"
-                sleep 5
-              done
-              clickhouse-client --host clickhouse --queries-file /schema/clickhouse-schema.sql
-              clickhouse-client --host clickhouse --query 'SHOW TABLES FROM explained'
-          volumeMounts:
-            - name: schema
-              mountPath: /schema
-          resources:
-            requests:
-              cpu: 50m
-              memory: 128Mi
-            limits:
-              memory: 512Mi
-      volumes:
-        - name: schema
-          configMap:
-            name: clickhouse-schema-sql

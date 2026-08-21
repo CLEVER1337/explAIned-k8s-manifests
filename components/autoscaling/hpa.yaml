@@ -1,0 +1,127 @@
+# Pulled out of the service manifests because not every environment can have them: the k3s
+# homelab deploys under a namespace-scoped account whose Role covers apps/batch/networking and
+# the core objects, but not the `autoscaling` or `policy` API groups. Applying an HPA there
+# fails with a 403 before anything useful lands.
+#
+# So autoscaling is opt-in. An overlay that can create these adds the component; one that
+# cannot leaves it out and pins replica counts instead.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: article-service
+  labels:
+    app.kubernetes.io/name: article-service
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: article-service
+  minReplicas: 2
+  # Hard ceiling at the partition count of articles.events. Every replica of this Deployment
+  # is also a member of the `article-service-indexer` consumer group, so raising this without
+  # also raising `--partitions` on the topic buys nothing: the extra replicas serve HTTP but
+  # join the group with no assignment.
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Slow on the way down: each removal is a rebalance, and thrashing the group is worse
+      # than carrying a spare pod for five minutes.
+      stabilizationWindowSeconds: 300
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: comment-service
+  labels:
+    app.kubernetes.io/name: comment-service
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: comment-service
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: profile-service
+  labels:
+    app.kubernetes.io/name: profile-service
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: profile-service
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: recommendation-service
+  labels:
+    app.kubernetes.io/name: recommendation-service
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: recommendation-service
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ranking-service
+  labels:
+    app.kubernetes.io/name: ranking-service
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ranking-service
+  minReplicas: 2
+  # Scales freely — a LightGBM booster is a few megabytes, so a second copy costs nothing.
+  # Unlike faiss-service, where every replica is another full copy of the index.
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

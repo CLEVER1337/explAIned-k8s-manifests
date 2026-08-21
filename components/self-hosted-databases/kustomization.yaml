@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# PostgreSQL, ClickHouse and Elasticsearch as StatefulSets, for an environment that has no
+# other place to put them.
+#
+# The homelab overlay does not use this component: those three already run on VMs of their
+# own there, provisioned by clever-homelab, with their own tuning for the memory each guest
+# has. Running a second copy inside a 2.5 GB k3s node would be strictly worse.
+#
+# `base/config/shared-config.yaml` already points at the Service names these create
+# (`postgres`, `clickhouse`, `elasticsearch`), so adding this component needs no patch —
+# and pointing elsewhere is what the homelab overlay patches instead.
+# Only the servers. The Job that applies the ClickHouse schema stays in base, because the
+# tables have to exist wherever ClickHouse runs — on a VM just as much as in a pod.
+resources:
+  - postgres.yaml
+  - clickhouse.yaml
+  - elasticsearch.yaml

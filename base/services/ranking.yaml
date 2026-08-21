@@ -72,6 +72,13 @@ spec:
               value: $(CLICKHOUSE_URL)
             - name: CLICKHOUSE_DATABASE
               value: $(CLICKHOUSE_DATABASE)
+            - name: CLICKHOUSE_USER
+              value: $(CLICKHOUSE_USER)
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-clickhouse
+                  key: CLICKHOUSE_PASSWORD
             - name: ARTICLES_BASE_URL
               value: $(ARTICLES_BASE_URL)
             - name: PROFILES_BASE_URL
@@ -136,25 +143,3 @@ spec:
         - name: mlflow
           persistentVolumeClaim:
             claimName: mlflow-store
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: ranking-service
-  labels:
-    app.kubernetes.io/name: ranking-service
-    app.kubernetes.io/component: api
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: ranking-service
-  minReplicas: 2
-  maxReplicas: 6
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70

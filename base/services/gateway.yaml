@@ -1,0 +1,85 @@
+# One origin in front of the five public services. See files/gateway.conf for the path map
+# and why the routing lives here rather than in an Ingress.
+#
+# The Service is ClusterIP in base. How it gets reached from outside is the overlay's
+# business: the dev overlay puts an Ingress in front of it, the homelab overlay turns it into
+# a NodePort that Caddy proxies to. Both hit the same path map, which is the point of having
+# it in one place.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: gateway
+spec:
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+        app.kubernetes.io/component: gateway
+    spec:
+      containers:
+        - name: nginx
+          # The unprivileged variant: runs as uid 101, writes its temp paths under /tmp, and
+          # needs no root at any point. The stock nginx image starts as root to bind :80 and
+          # drops afterwards, which is a capability this has no use for.
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: gateway.conf
+              readOnly: true
+            - name: cache
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 20m
+              memory: 24Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: gateway-config
+        - name: cache
+          emptyDir: {}

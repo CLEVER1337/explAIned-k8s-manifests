@@ -1,17 +1,18 @@
-# The docker-compose version of this file listed eight static targets on localhost. That list
-# was a maintenance liability even then; under an HPA it is simply wrong, because the thing
-# being scraped is a pod and pods come and go.
+# DNS service discovery against the headless Services in services/metrics-endpoints.yaml.
 #
-# So: one job, pod service discovery, and the pods opt in via annotations —
+# Not pod service discovery, which is the usual answer: that needs a ServiceAccount and a Role
+# to list pods with, and the k3s homelab's deploy account is namespace-scoped and cannot
+# create either. DNS needs no API access, resolves through the pod's own resolv.conf, and
+# produces the same target list. One config that works on kind and on k3s beats two that
+# each work in one place.
 #
-#     prometheus.io/scrape: "true"
-#     prometheus.io/port:   "5036"
-#     prometheus.io/path:   /metrics
+# The `service` label is set per job rather than relabelled off a pod label, and it is the
+# compatibility bridge: every panel in microservices.json and every alert in
+# recommendations.yml selects on service="article", service="faiss" and so on, so both carry
+# over from the docker-compose setup untouched.
 #
-# and carry the label `explained.io/service`, which is relabelled to `service` below. That
-# label is the compatibility bridge: every panel in microservices.json and every alert in
-# recommendations.yml selects on service="article", service="faiss" and so on, so the queries
-# carry over from the compose setup untouched.
+# Names are short, so they resolve through the search domain of whatever namespace this runs
+# in. Nothing here has to change to stand a second copy of the stack up next door.
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -24,35 +25,65 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  - job_name: explained-pods
-    kubernetes_sd_configs:
-      - role: pod
-        namespaces:
-          # Scoped to wherever this Prometheus runs, which is what lets the RBAC below be a
-          # namespaced Role instead of a ClusterRole. Deploying the stack twice gives each
-          # copy its own Prometheus watching only itself.
-          own_namespace: true
+  - job_name: identity
+    dns_sd_configs:
+      - names: ['identity-service-metrics']
+        type: A
+        port: 5125
     relabel_configs:
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
-        action: keep
-        regex: "true"
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
-        action: replace
-        target_label: __metrics_path__
-        regex: (.+)
-      # Discovery hands over the pod IP with the first container port. Swap in the annotated
-      # port so a pod exposing several ports is still scraped on the right one.
-      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
-        action: replace
-        regex: ([^:]+)(?::\d+)?;(\d+)
-        replacement: $1:$2
-        target_label: __address__
-      - source_labels: [__meta_kubernetes_pod_label_explained_io_service]
-        action: replace
-        target_label: service
-      - source_labels: [__meta_kubernetes_namespace]
-        action: replace
-        target_label: namespace
-      - source_labels: [__meta_kubernetes_pod_name]
-        action: replace
-        target_label: pod
+      - target_label: service
+        replacement: identity
+
+  - job_name: article
+    dns_sd_configs:
+      - names: ['article-service-metrics']
+        type: A
+        port: 5036
+    relabel_configs:
+      - target_label: service
+        replacement: article
+
+  - job_name: comment
+    dns_sd_configs:
+      - names: ['comment-service-metrics']
+        type: A
+        port: 5046
+    relabel_configs:
+      - target_label: service
+        replacement: comment
+
+  - job_name: profile
+    dns_sd_configs:
+      - names: ['profile-service-metrics']
+        type: A
+        port: 5066
+    relabel_configs:
+      - target_label: service
+        replacement: profile
+
+  - job_name: recommendation
+    dns_sd_configs:
+      - names: ['recommendation-service-metrics']
+        type: A
+        port: 5056
+    relabel_configs:
+      - target_label: service
+        replacement: recommendation
+
+  - job_name: faiss
+    dns_sd_configs:
+      - names: ['faiss-service-metrics']
+        type: A
+        port: 8001
+    relabel_configs:
+      - target_label: service
+        replacement: faiss
+
+  - job_name: ranking
+    dns_sd_configs:
+      - names: ['ranking-service-metrics']
+        type: A
+        port: 8002
+    relabel_configs:
+      - target_label: service
+        replacement: ranking

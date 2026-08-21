@@ -1,0 +1,135 @@
+# A headless Service per scrapeable workload, existing only so Prometheus can find the pods.
+#
+# The obvious way to do this is pod service discovery, and that is what the first draft did.
+# It does not survive contact with the k3s homelab: the deploy account there is namespace-
+# scoped and cannot create a ServiceAccount, a Role or a RoleBinding, so a Prometheus with
+# `kubernetes_sd_configs` has no credential to list pods with and discovers nothing.
+#
+# DNS discovery needs no API access at all. A headless Service publishes one A record per
+# ready pod, Prometheus resolves the name every 30s, and the result is the same target list —
+# minus the RBAC, and minus the temptation to widen a deploy account that is deliberately
+# narrow. It works identically on kind and on k3s, so there is one scrape config, not two.
+#
+# These carry no ports the application uses; they duplicate the metrics port of the real
+# Service next to them. event-consumer-service is absent because it has no /metrics endpoint
+# at all — its Program.cs never calls MapMetrics. Watch its consumer-group lag instead.
+apiVersion: v1
+kind: Service
+metadata:
+  name: identity-service-metrics
+  labels:
+    app.kubernetes.io/name: identity-service
+    app.kubernetes.io/component: metrics
+spec:
+  clusterIP: None
+  # Discovery only. Without this a pod that is starting up, or failing its readiness probe,
+  # drops out of DNS and Prometheus stops scraping exactly when the metrics matter most.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: identity-service
+  ports:
+    - name: metrics
+      port: 5125
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: article-service-metrics
+  labels:
+    app.kubernetes.io/name: article-service
+    app.kubernetes.io/component: metrics
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: article-service
+  ports:
+    - name: metrics
+      port: 5036
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: comment-service-metrics
+  labels:
+    app.kubernetes.io/name: comment-service
+    app.kubernetes.io/component: metrics
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: comment-service
+  ports:
+    - name: metrics
+      port: 5046
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: profile-service-metrics
+  labels:
+    app.kubernetes.io/name: profile-service
+    app.kubernetes.io/component: metrics
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: profile-service
+  ports:
+    - name: metrics
+      port: 5066
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recommendation-service-metrics
+  labels:
+    app.kubernetes.io/name: recommendation-service
+    app.kubernetes.io/component: metrics
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: recommendation-service
+  ports:
+    - name: metrics
+      port: 5056
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: faiss-service-metrics
+  labels:
+    app.kubernetes.io/name: faiss-service
+    app.kubernetes.io/component: metrics
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: faiss-service
+  ports:
+    - name: metrics
+      port: 8001
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ranking-service-metrics
+  labels:
+    app.kubernetes.io/name: ranking-service
+    app.kubernetes.io/component: metrics
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: ranking-service
+  ports:
+    - name: metrics
+      port: 8002
+      targetPort: http

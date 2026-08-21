@@ -1,0 +1,59 @@
+# Dev-only. A laptop cluster has an ingress controller available (kind's nginx addon,
+# minikube's `addons enable ingress`), so the shortest path from a browser to the stack is a
+# hostname rather than a port-forward.
+#
+# It carries no path rules: every route lives in the gateway's nginx config, in one place, so
+# that the dev and homelab environments cannot drift apart on something as easy to get wrong
+# as which prefix belongs to which service. This just puts a name in front of it.
+#
+# The homelab has no ingress controller at all — Traefik is disabled there — and reaches the
+# same gateway through a NodePort that Caddy proxies to.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: explained-api
+  labels:
+    app.kubernetes.io/name: explained-api
+    app.kubernetes.io/component: ingress
+  annotations:
+    # The gateway applies the same limit itself; this stops the controller rejecting an avatar
+    # upload before it ever gets there.
+    nginx.ingress.kubernetes.io/proxy-body-size: 2m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.explained.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: explained-grafana
+  labels:
+    app.kubernetes.io/name: explained-grafana
+    app.kubernetes.io/component: ingress
+spec:
+  ingressClassName: nginx
+  rules:
+    # Its own host rather than a /grafana path: serving Grafana from a subpath needs
+    # GF_SERVER_SERVE_FROM_SUB_PATH plus a matching root_url, and getting that pair half-right
+    # produces a UI that loads and then breaks on the first redirect.
+    - host: grafana.explained.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000

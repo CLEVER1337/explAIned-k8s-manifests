@@ -1,0 +1,447 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The k3s cluster in clever-homelab. Three things about that environment shape everything
+# below, and none of them are preferences:
+#
+#  1. PostgreSQL, ClickHouse and Elasticsearch already run on VMs of their own, tuned for the
+#     RAM those guests have. The self-hosted-databases component is not added; the endpoints
+#     ConfigMap is repointed at 10.42.0.20/.21/.22 instead.
+#  2. The deploy account is namespace-scoped. Its Role covers core objects, apps, batch and
+#     networking — not `autoscaling`, not `policy`, not RBAC, and not namespaces. So: no HPAs,
+#     no PodDisruptionBudgets, no ServiceAccounts, and `apps` is joined rather than created.
+#  3. Two agents, 2 vCPU and 2.5 GB each, on 10 GB disks. That is the binding constraint on
+#     this whole file. Every request below was picked to fit inside roughly 4 GB of
+#     schedulable memory with the offline jobs still able to start.
+namespace: apps
+
+resources:
+  - ../../base
+
+# No components. Both of them describe things this cluster either already has or will not
+# allow — see the header.
+
+secretGenerator:
+  - name: explained-postgres
+    envs:
+      - secrets/postgres.env
+  - name: explained-redis
+    envs:
+      - secrets/redis.env
+  - name: explained-elasticsearch
+    envs:
+      - secrets/elasticsearch.env
+  - name: explained-clickhouse
+    envs:
+      - secrets/clickhouse.env
+  - name: explained-jwt
+    envs:
+      - secrets/jwt.env
+  - name: explained-grafana
+    envs:
+      - secrets/grafana.env
+
+# One of everything. Not a starting point to tune later: two replicas of the eight workloads
+# would not fit, and the HPAs that would normally decide this cannot be created here anyway.
+replicas:
+  - name: identity-service
+    count: 1
+  - name: article-service
+    count: 1
+  - name: comment-service
+    count: 1
+  - name: profile-service
+    count: 1
+  - name: recommendation-service
+    count: 1
+  - name: ranking-service
+    count: 1
+  - name: gateway
+    count: 1
+
+patches:
+  # ── Where the databases actually are ─────────────────────────────────────────────────
+  # Fixed addresses written by cloud-init, so there is no DHCP for these to drift under.
+  # The accounts are the ones the Ansible roles create: `app` everywhere, each confined to
+  # what the project needs. Passwords are generated on each guest and live in /etc/homelab —
+  # see README.md for pulling them into the Secrets above.
+  - target:
+      kind: ConfigMap
+      name: explained-endpoints
+    patch: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: explained-endpoints
+      data:
+        POSTGRES_HOST: 10.42.0.20
+        POSTGRES_USER: app
+        ELASTICSEARCH_URL: http://10.42.0.22:9200
+        ELASTICSEARCH_USERNAME: app
+        CLICKHOUSE_HOST: 10.42.0.21
+        CLICKHOUSE_URL: http://10.42.0.21:8123
+        CLICKHOUSE_USER: app
+        # What Caddy terminates TLS for. Every service compares issuer and audience as
+        # strings, so this has to be settled before the first token is minted.
+        JWT_ISSUER: https://explained.homelab.lan/
+        JWT_AUDIENCE: https://explained.homelab.lan/
+
+  # ── Getting in from the LAN ──────────────────────────────────────────────────────────
+  # Caddy on the Forgejo VM round-robins one hostname across both agents at one NodePort;
+  # there is no ingress controller in this cluster, because 80 and 443 on the hypervisor are
+  # already DNAT'd to that Caddy and Traefik is disabled. The path routing happens inside the
+  # gateway pod. Two entries in `caddy_k3s_apps` publish these — README.md has them.
+  - target:
+      kind: Service
+      name: gateway
+    patch: |
+      # `add`, not `replace`: base leaves spec.type unset (ClusterIP is the default), and
+      # JSON Patch `replace` on a field that is not there fails the whole build.
+      - op: add
+        path: /spec/type
+        value: NodePort
+      - op: add
+        path: /spec/ports/0/nodePort
+        value: 30080
+  - target:
+      kind: Service
+      name: grafana
+    patch: |
+      - op: add
+        path: /spec/type
+        value: NodePort
+      - op: add
+        path: /spec/ports/0/nodePort
+        value: 30300
+  - target:
+      kind: Deployment
+      name: grafana
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: grafana
+      spec:
+        template:
+          spec:
+            containers:
+              - name: grafana
+                env:
+                  - name: GF_SERVER_ROOT_URL
+                    value: https://grafana.explained.homelab.lan/
+
+  # ── Memory, which is the whole game here ─────────────────────────────────────────────
+  # ~4 GB schedulable across two agents once k3s and the system have taken their share.
+  # The four quiet services first: no background workers, no in-process index, no JVM.
+  - target:
+      kind: Deployment
+      name: identity-service|comment-service|profile-service|event-consumer-service
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 50m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 128Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 320Mi
+
+  # Runs the API plus the outbox publisher plus the ES indexer in one process.
+  - target:
+      kind: Deployment
+      name: article-service
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 192Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 448Mi
+
+  - target:
+      kind: Deployment
+      name: recommendation-service
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 160Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 384Mi
+
+  # The index is held flat in process memory — this scales with the corpus, not with traffic.
+  # 320Mi is roughly 200k articles at 384 dimensions plus the interpreter; raise it when the
+  # article count does, and watch for the build job being OOMKilled first.
+  - target:
+      kind: Deployment
+      name: faiss-service
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 320Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 640Mi
+
+  - target:
+      kind: Deployment
+      name: ranking-service
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 288Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 576Mi
+
+  # Kafka is the single largest thing left in the cluster and the most likely to be killed.
+  # The heap is pinned rather than left to the JVM's default sizing, which reads the *node's*
+  # memory and would pick ~640m against a cgroup that allows 768.
+  - target:
+      kind: StatefulSet
+      name: kafka
+    patch: |
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: kafka
+      spec:
+        template:
+          spec:
+            containers:
+              - name: kafka
+                env:
+                  - name: KAFKA_HEAP_OPTS
+                    value: -Xms384m -Xmx384m
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 576Mi
+                  limits:
+                    memory: 768Mi
+
+  - target:
+      kind: StatefulSet
+      name: redis
+    patch: |
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: redis
+      spec:
+        template:
+          spec:
+            containers:
+              - name: redis
+                resources:
+                  requests:
+                    cpu: 25m
+                    memory: 64Mi
+                  limits:
+                    # `rec:*` is the working set and it is small — a few hundred user
+                    # embeddings and the trending list. maxmemory-policy is noeviction in
+                    # base, so this must not be tight enough to start refusing writes.
+                    memory: 256Mi
+
+  - target:
+      kind: Deployment
+      name: prometheus
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: prometheus
+      spec:
+        template:
+          spec:
+            containers:
+              - name: prometheus
+                args:
+                  - --config.file=/etc/prometheus/prometheus.yml
+                  - --storage.tsdb.path=/prometheus
+                  # 7 days, not 15: the agents have 10 GB disks and the head block plus a
+                  # fortnight of samples is not what that space is for.
+                  - --storage.tsdb.retention.time=7d
+                  - --web.enable-lifecycle
+                resources:
+                  requests:
+                    cpu: 50m
+                    memory: 192Mi
+                  limits:
+                    memory: 448Mi
+
+  - target:
+      kind: Deployment
+      name: grafana
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 128Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 256Mi
+
+  # ── The offline jobs ─────────────────────────────────────────────────────────────────
+  # These are the awkward tenants: they need more memory than anything else in the namespace,
+  # for a few minutes, on a schedule. concurrencyPolicy is already Forbid in base, and the
+  # schedules are staggered, so at most one heavy job should be resident at a time.
+  #
+  # ml-embeddings is the one to watch. It loads SBERT and encodes in batches, and it is the
+  # first thing to be OOMKilled when the cluster is full — an exit 137 in its log, not a
+  # Python traceback. If that becomes routine, the honest fixes are more RAM on the agents or
+  # moving this one job to a VM; shrinking the batch only postpones it.
+  - target:
+      kind: CronJob
+      name: ml-embeddings
+    patch: |
+      - op: replace
+        path: /spec/schedule
+        value: "20 * * * *"
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/cpu
+        value: 200m
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/memory
+        value: 768Mi
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/limits/memory
+        value: 1536Mi
+
+  - target:
+      kind: CronJob
+      name: ml-train-als|ml-train-lightgbm
+    patch: |
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/cpu
+        value: 200m
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/memory
+        value: 640Mi
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/limits/memory
+        value: 1280Mi
+
+  - target:
+      kind: CronJob
+      name: ml-update-trending|ml-build-user-embeddings|ml-build-features
+    patch: |
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/memory
+        value: 320Mi
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/limits/memory
+        value: 768Mi
+
+  - target:
+      kind: CronJob
+      name: faiss-build-index
+    patch: |
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/requests/memory
+        value: 256Mi
+      - op: replace
+        path: /spec/jobTemplate/spec/template/spec/containers/0/resources/limits/memory
+        value: 640Mi
+
+  # ── Storage ──────────────────────────────────────────────────────────────────────────
+  # k3s ships local-path and nothing else, so ReadWriteMany is not on offer. That turns out
+  # to be fine rather than a compromise: a local-path PV carries node affinity, so the
+  # scheduler pins every pod that mounts it to the node holding the data, and ReadWriteOnce
+  # means "one node", not "one pod". The faiss-build-index CronJob and faiss-service therefore
+  # share the volume exactly as intended — as long as each stays at one replica, which is why
+  # neither is in the `replicas` list above with a number greater than 1.
+  #
+  # Sizes matter more than usual: the agents have 10 GB disks and containerd's image cache is
+  # already pruned weekly to keep them from filling.
+  - target:
+      kind: PersistentVolumeClaim
+      name: faiss-index|mlflow-store
+    patch: |
+      - op: replace
+        path: /spec/accessModes/0
+        value: ReadWriteOnce
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: 1Gi
+  - target:
+      kind: PersistentVolumeClaim
+      name: prometheus-data
+    patch: |
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: 2Gi
+  - target:
+      kind: PersistentVolumeClaim
+      name: grafana-data
+    patch: |
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: 1Gi
+  - target:
+      kind: StatefulSet
+      name: kafka
+    patch: |
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 2Gi
+  - target:
+      kind: StatefulSet
+      name: redis
+    patch: |
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 1Gi
+
+# Forgejo's registry, scoped to the `ci` account that pushes there. No imagePullSecrets on any
+# pod: the homelab attaches `forgejo-registry` to the namespace's default ServiceAccount, so
+# a pull just works.
+#
+# The tags are what CI sets — `kustomize edit set image explained/article-service=...:$SHA`
+# in the workflow, not an edit by hand. `main` is the fallback for a manual apply.
+images:
+  - name: explained/identity-service
+    newName: git.homelab.lan/ci/explained-identity-service
+    newTag: main
+  - name: explained/article-service
+    newName: git.homelab.lan/ci/explained-article-service
+    newTag: main
+  - name: explained/comment-service
+    newName: git.homelab.lan/ci/explained-comment-service
+    newTag: main
+  - name: explained/profile-service
+    newName: git.homelab.lan/ci/explained-profile-service
+    newTag: main
+  - name: explained/recommendation-service
+    newName: git.homelab.lan/ci/explained-recommendation-service
+    newTag: main
+  - name: explained/event-consumer-service
+    newName: git.homelab.lan/ci/explained-event-consumer-service
+    newTag: main
+  - name: explained/faiss-service
+    newName: git.homelab.lan/ci/explained-faiss-service
+    newTag: main
+  - name: explained/ranking-service
+    newName: git.homelab.lan/ci/explained-ranking-service
+    newTag: main
+  - name: explained/ml-jobs
+    newName: git.homelab.lan/ci/explained-ml-jobs
+    newTag: main

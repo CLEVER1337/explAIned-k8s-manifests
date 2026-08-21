@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# CPU-based autoscaling plus disruption budgets. Needs the `autoscaling` and `policy` API
+# groups, and a metrics-server the HPAs can read from — k3s ships one, kind and minikube do
+# not enable it by default.
+resources:
+  - hpa.yaml
+  - pdb.yaml

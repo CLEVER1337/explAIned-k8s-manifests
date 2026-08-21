@@ -2,17 +2,28 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 # A whole explAIned on one machine — kind, minikube, k3s, Docker Desktop. Sized to fit, not to
-# survive anything: one replica of everything, no autoscaling, no disruption budgets, small
-# heaps, small volumes.
+# survive anything: one replica of everything, small heaps, small volumes.
+#
+# This is the overlay that carries the databases in-cluster. The homelab one does not.
 namespace: explained
 
 resources:
+  - namespace.yaml
   - ../../base
+  - ingress.yaml
+
+components:
+  # PostgreSQL, ClickHouse and Elasticsearch as StatefulSets. base points at their Service
+  # names already, so adding them needs no patch.
+  - ../../components/self-hosted-databases
+  # HPAs and PDBs are *not* added here: with one replica of everything an HPA would
+  # immediately fight the counts below, and `minAvailable: 1` against a single replica makes
+  # the pod undrainable. The component exists for environments with room to scale.
 
 # The dev credentials are committed on purpose. They are the same values already sitting in
 # the repo's appsettings.json files, so there is nothing here that is not already public, and
-# having them in git is what makes `kubectl apply -k overlays/dev` a one-liner. The prod
-# overlay does the opposite — see overlays/prod/README.md.
+# having them in git is what makes `kubectl apply -k overlays/dev` a one-liner. The homelab
+# overlay does the opposite — see overlays/homelab/README.md.
 secretGenerator:
   - name: explained-postgres
     envs:
@@ -23,6 +34,9 @@ secretGenerator:
   - name: explained-elasticsearch
     envs:
       - secrets/elasticsearch.env
+  - name: explained-clickhouse
+    envs:
+      - secrets/clickhouse.env
   - name: explained-jwt
     envs:
       - secrets/jwt.env
@@ -43,33 +57,12 @@ replicas:
     count: 1
   - name: ranking-service
     count: 1
+  - name: gateway
+    count: 1
 
 patches:
-  # HPAs would immediately scale past the replica counts above and fight them, and on a
-  # single-node cluster there is nothing to scale onto anyway. Dropping them entirely is
-  # clearer than setting min=max=1 and pretending.
-  - target:
-      kind: HorizontalPodAutoscaler
-    patch: |
-      $patch: delete
-      apiVersion: autoscaling/v2
-      kind: HorizontalPodAutoscaler
-      metadata:
-        name: placeholder
-
-  # With one replica of everything, minAvailable: 1 means "never evictable" — `kubectl drain`
-  # on the only node would hang forever.
-  - target:
-      kind: PodDisruptionBudget
-    patch: |
-      $patch: delete
-      apiVersion: policy/v1
-      kind: PodDisruptionBudget
-      metadata:
-        name: placeholder
-
-  # 1 GB of heap plus 2 GB of limit is most of a laptop's headroom for a search index holding
-  # a few hundred articles.
+  # 1 GB of heap plus a 2 GB limit is most of a laptop's headroom for a search index holding a
+  # few hundred articles.
   #
   # A strategic merge rather than a JSON patch: env lists merge by container name and env
   # name, so this keeps working when someone adds a variable above ES_JAVA_OPTS. An
@@ -136,10 +129,9 @@ patches:
         path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
         value: 5Gi
 
-  # local-path and hostPath provisioners hand out ReadWriteOnce and ignore the request for
-  # RWX. On one node that is survivable: every pod lands on the same machine, so the CronJob
-  # writer and the service reader still see the same directory. It stops working the moment
-  # there is a second node — which is exactly why prod does not do this.
+  # local-path and hostPath provisioners hand out ReadWriteOnce and ignore a request for RWX.
+  # On one node that is survivable: every pod lands on the same machine, so the CronJob writer
+  # and the service reader still see the same directory.
   - target:
       kind: PersistentVolumeClaim
       name: faiss-index|mlflow-store

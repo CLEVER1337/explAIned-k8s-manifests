@@ -1,25 +1,31 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: explained
+# No `namespace:` here on purpose. The two environments disagree — a dedicated `explained`
+# namespace on a laptop cluster, the pre-existing `apps` namespace on the k3s homelab, whose
+# deploy account cannot create namespaces at all. Each overlay sets its own.
+#
+# Nothing in base assumes it can create cluster-scoped objects or touch API groups beyond
+# core/apps/batch/networking, because the homelab's deploy Role does not reach further.
+# Autoscaling and disruption budgets live in components/autoscaling for that reason, and
+# Prometheus discovers its targets over DNS rather than through the API.
 
-# includeSelectors: false — this is a marker for humans and for NetworkPolicy selectors, not
-# something that belongs in a Deployment's immutable `spec.selector`.
 labels:
   - includeSelectors: false
     pairs:
       app.kubernetes.io/part-of: explained
 
 resources:
-  - namespace.yaml
   - storage/pvc.yaml
   - config/shared-config.yaml
 
-  - infra/postgres.yaml
+  # Redis and Kafka only. PostgreSQL, ClickHouse and Elasticsearch are in
+  # components/self-hosted-databases, because an environment that already has them elsewhere
+  # should not be shipped a second copy it has to delete.
   - infra/redis.yaml
   - infra/kafka.yaml
-  - infra/elasticsearch.yaml
-  - infra/clickhouse.yaml
+  # The tables, though, are needed wherever ClickHouse lives.
+  - infra/clickhouse-schema.yaml
 
   - services/identity.yaml
   - services/article.yaml
@@ -29,15 +35,14 @@ resources:
   - services/event-consumer.yaml
   - services/faiss.yaml
   - services/ranking.yaml
-  - services/pdb.yaml
+  - services/gateway.yaml
+  - services/metrics-endpoints.yaml
 
   - jobs/faiss-build-index.yaml
   - jobs/ml-cronjobs.yaml
 
   - monitoring/prometheus.yaml
   - monitoring/grafana.yaml
-
-  - ingress.yaml
 
 # Generated rather than checked in as ConfigMap manifests, for one reason: kustomize appends a
 # content hash to the name, so editing any of these files renames the ConfigMap and the
@@ -46,13 +51,17 @@ resources:
 #
 # (explained-endpoints in config/shared-config.yaml is the deliberate exception — it is
 # hand-written so it can carry its comments, which means editing it needs an explicit
-# `kubectl rollout restart`. The Makefile target does that.)
+# `kubectl rollout restart`. `make restart` does that.)
 configMapGenerator:
   - name: clickhouse-schema-sql
     files:
       # Verbatim copy of explAInedArticleEventConsumerService/schema.sql. `make sync-upstream`
-      # refreshes it; the drift check in the README catches it going stale.
+      # refreshes it; `make check-drift` fails when it goes stale.
       - infra/files/clickhouse-schema.sql
+
+  - name: gateway-config
+    files:
+      - services/files/gateway.conf
 
   # Both of these replace the appsettings.json inside their image, and both are smaller than
   # the file they replace. The reason is in the files themselves — short version: those two

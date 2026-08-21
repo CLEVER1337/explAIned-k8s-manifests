@@ -1,0 +1,88 @@
+# Creates the analytics tables. In base rather than in the self-hosted-databases component,
+# because the tables are needed wherever ClickHouse lives — the consumer service does not
+# create its own schema, and an insert against a missing table simply fails.
+#
+# schema.sql is verbatim from explAInedArticleEventConsumerService/schema.sql and every
+# statement in it is IF NOT EXISTS, so this is safe to re-run. It goes through
+# clickhouse-client rather than curl because the HTTP interface rejects multi-statement
+# bodies.
+#
+# The CREATE DATABASE is handled separately and allowed to fail. Two environments, two
+# situations:
+#
+#   in-cluster   `default` on a fresh server may create it, and must.
+#   homelab VM   the database is created by Ansible with clickhouse-client on loopback; the
+#                `app` account this Job connects as holds `GRANT ALL ON explained.*` and no
+#                CREATE DATABASE privilege at all, so the statement is refused — correctly.
+#
+# Filtering the line out of the file and attempting it on its own is what lets one Job cover
+# both without a second copy of the schema drifting alongside the first.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: clickhouse-schema
+  labels:
+    app.kubernetes.io/name: clickhouse-schema
+    app.kubernetes.io/component: bootstrap
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clickhouse-schema
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: apply-schema
+          image: clickhouse/clickhouse-server:25.3-alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              CH="clickhouse-client --host $CLICKHOUSE_HOST --port 9000 --user $CLICKHOUSE_USER"
+              # `if`, not `[ ... ] && ...`: under `set -e` a false test as the last command of
+              # the line takes the whole script down, and an empty password is the normal case
+              # in-cluster.
+              if [ -n "${CLICKHOUSE_PASSWORD:-}" ]; then
+                CH="$CH --password $CLICKHOUSE_PASSWORD"
+              fi
+
+              for i in $(seq 1 60); do
+                if $CH --query 'SELECT 1' >/dev/null 2>&1; then break; fi
+                echo "waiting for $CLICKHOUSE_HOST ($i/60)"
+                sleep 5
+              done
+
+              # Allowed to fail: see the header. Anywhere the account cannot create a
+              # database, something else already has.
+              $CH --query "CREATE DATABASE IF NOT EXISTS $CLICKHOUSE_DATABASE" \
+                || echo "could not create $CLICKHOUSE_DATABASE — assuming it already exists"
+
+              grep -v '^CREATE DATABASE' /schema/clickhouse-schema.sql > /tmp/schema.sql
+              $CH --queries-file /tmp/schema.sql
+              $CH --query "SHOW TABLES FROM $CLICKHOUSE_DATABASE"
+          envFrom:
+            - configMapRef:
+                name: explained-endpoints
+          env:
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: explained-clickhouse
+                  key: CLICKHOUSE_PASSWORD
+          volumeMounts:
+            - name: schema
+              mountPath: /schema
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: schema
+          configMap:
+            name: clickhouse-schema-sql

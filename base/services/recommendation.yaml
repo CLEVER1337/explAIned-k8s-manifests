@@ -94,6 +94,18 @@ spec:
               value: $(CLICKHOUSE_URL)
             - name: ClickHouse__Database
               value: $(CLICKHOUSE_DATABASE)
+            # ClickHouseImpressionLog originally sent no credentials at all — it posted to
+            # `?database=...` and nothing else, which works only against a server whose
+            # `default` user has no password and accepts remote connections. Program.cs now
+            # attaches Basic auth when these two are set; leaving them empty restores the old
+            # anonymous behaviour.
+            - name: ClickHouse__Username
+              value: $(CLICKHOUSE_USER)
+            - name: ClickHouse__Password
+              valueFrom:
+                secretKeyRef:
+                  name: explained-clickhouse
+                  key: CLICKHOUSE_PASSWORD
             - name: ClickHouse__ImpressionsTable
               value: feed_impressions
             - name: ClickHouse__BatchSize
@@ -151,25 +163,3 @@ spec:
             name: recommendation-appsettings
         - name: tmp
           emptyDir: {}
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: recommendation-service
-  labels:
-    app.kubernetes.io/name: recommendation-service
-    app.kubernetes.io/component: api
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: recommendation-service
-  minReplicas: 2
-  maxReplicas: 8
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
