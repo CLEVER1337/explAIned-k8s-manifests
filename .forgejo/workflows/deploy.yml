@@ -85,57 +85,118 @@ jobs:
           kubectl -n apps delete job kafka-create-topics clickhouse-schema \
             --ignore-not-found --wait=true
 
-      - name: Apply
-        run: kubectl -n apps apply -f /tmp/rendered.yaml
+      # What is healthy right now, before anything changes. This is the baseline the
+      # rollout check below is judged against, and it is what keeps an incremental rollout
+      # honest: on a cluster where six services have never had an image pushed, "not ready"
+      # is the status quo, not something this deploy broke.
+      - name: Snapshot what is already healthy
+        run: |
+          set -eu
+          kubectl -n apps get deployments,statefulsets -l app.kubernetes.io/part-of=explained \
+            -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.status.readyReplicas} {.spec.replicas}{"\n"}{end}' \
+            | awk '$2 != "" && $2 == $3 { print tolower($1) }' | sort > /tmp/healthy-before
+          echo "healthy before this deploy:"; sed 's/^/  /' /tmp/healthy-before
 
-      # `apply` returns as soon as the API server has the objects. This is what turns a
-      # green tick into a statement about running pods.
+      # `tee`, because the output is data: apply prints `configured` for what it changed and
+      # `unchanged` for what it did not, and that is a far more reliable answer to "what did
+      # this deploy touch" than diffing the commit.
+      - name: Apply
+        run: |
+          set -eu
+          kubectl -n apps apply -f /tmp/rendered.yaml | tee /tmp/apply.out
+          grep -E '^(deployment|statefulset)\.apps/.*(configured|created)$' /tmp/apply.out \
+            | sed 's|\.apps/|/|; s/ .*//' | sort > /tmp/changed
+          echo "changed by this deploy:"; sed 's/^/  /' /tmp/changed
+
+      # `apply` returns as soon as the API server has the objects. This turns a green tick
+      # into a statement about running pods — but only about the pods this deploy is
+      # answerable for.
       #
-      # CronJobs are deliberately not waited on: a new ml-jobs tag does not "roll out", it
-      # takes effect at the next scheduled run. That part of the deploy is invisible here.
+      # Two sets are waited on, and nothing else:
+      #   changed         this deploy altered it, so it had better come up
+      #   healthy-before  it was working, so it had better still be
+      #
+      # Everything outside that union is reported and ignored. That is the difference
+      # between "the deploy failed" and "six services you have not released yet still have
+      # no image", which the first version of this file could not tell apart — it waited on
+      # everything, then rolled back the one service that had just been released.
+      #
+      # CronJobs are deliberately absent: a new ml-jobs tag does not "roll out", it takes
+      # effect at the next scheduled run. That part of a deploy is invisible here.
       - name: Wait for the rollouts
         run: |
           set -eu
-          failed=""
-          for d in $(kubectl -n apps get deployments -l app.kubernetes.io/part-of=explained \
-                       -o jsonpath='{.items[*].metadata.name}'); do
-            echo "--- $d"
-            kubectl -n apps rollout status "deployment/$d" --timeout=180s || failed="$failed $d"
-          done
-          for s in $(kubectl -n apps get statefulsets -l app.kubernetes.io/part-of=explained \
-                       -o jsonpath='{.items[*].metadata.name}'); do
-            echo "--- $s"
-            kubectl -n apps rollout status "statefulset/$s" --timeout=300s || failed="$failed $s"
-          done
-          test -z "$failed" || { echo "did not become ready:$failed"; exit 1; }
+          sort -u /tmp/changed /tmp/healthy-before > /tmp/must-be-ready
 
-      # Only what actually failed, and only Deployments — `rollout undo` on a StatefulSet
-      # holding a volume is not a thing to do unattended.
+          failed=""
+          while read -r obj; do
+            [ -n "$obj" ] || continue
+            echo "--- $obj"
+            case "$obj" in
+              statefulset/*) t=300s ;;
+              *)             t=180s ;;
+            esac
+            kubectl -n apps rollout status "$obj" --timeout=$t || failed="$failed $obj"
+          done < /tmp/must-be-ready
+
+          # Informational: not this deploy's doing, and not a reason to fail it.
+          kubectl -n apps get deployments,statefulsets -l app.kubernetes.io/part-of=explained \
+            -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.status.readyReplicas} {.spec.replicas}{"\n"}{end}' \
+            | awk '$2 == "" || $2 != $3 { print tolower($1) }' | sort > /tmp/unready-after
+          comm -23 /tmp/unready-after /tmp/must-be-ready > /tmp/ignored || true
+          if [ -s /tmp/ignored ]; then
+            echo "::notice::not ready, and not touched by this deploy — unreleased or already broken:"
+            sed 's/^/  /' /tmp/ignored
+          fi
+
+          # Anything that was healthy before and is not now is a regression this deploy
+          # caused; the rollback step needs to know which.
+          if [ -n "$failed" ]; then
+            for obj in $failed; do
+              grep -qx "$obj" /tmp/healthy-before && echo "$obj" >> /tmp/regressed || true
+            done
+            echo "did not become ready:$failed"
+            exit 1
+          fi
+
+      # Only true regressions — something that was serving before this deploy and is not now.
+      # A newly released service that fails to start is deliberately left alone: undoing it
+      # would put back an image that was already broken, and the useful action is to look at
+      # the pod, then revert the commit.
       #
-      # This puts the cluster back on the previous ReplicaSet, which means it no longer
-      # matches git. Revert the offending commit; do not re-run this workflow and expect it
-      # to notice.
-      - name: Roll back what failed
+      # `rollout undo` on a StatefulSet holding a volume is not a thing to do unattended, so
+      # Deployments only.
+      - name: Roll back regressions
         if: failure()
         run: |
-          for d in $(kubectl -n apps get deployments -l app.kubernetes.io/part-of=explained \
-                       -o jsonpath='{.items[*].metadata.name}'); do
-            ready=$(kubectl -n apps get deployment "$d" -o jsonpath='{.status.readyReplicas}')
-            want=$(kubectl -n apps get deployment "$d" -o jsonpath='{.spec.replicas}')
-            if [ "${ready:-0}" != "$want" ]; then
-              echo "rolling back $d"
-              kubectl -n apps rollout undo "deployment/$d" || true
-            fi
-          done
+          test -s /tmp/regressed || { echo "nothing regressed — leaving the cluster as it is"; exit 0; }
+          while read -r obj; do
+            case "$obj" in
+              deployment/*) echo "rolling back $obj"; kubectl -n apps rollout undo "$obj" || true ;;
+              *)            echo "not rolling back $obj automatically" ;;
+            esac
+          done < /tmp/regressed
           echo "::warning::rolled back — the cluster no longer matches master, revert the commit"
 
       # Through Caddy, on the real hostname, exactly as a user would reach it. Catches the
       # case every probe in this repository misses: a green rollout in front of an
       # application that cannot answer, because the probes hit /metrics and prove only that
       # Kestrel is listening.
+      #
+      # Skipped while the service behind the path has never been released. Asserting that
+      # /articles/search answers 200 is only meaningful once article-service has an image —
+      # until then the gateway correctly returns 502 and failing on it would say nothing
+      # about this deploy.
       - name: Smoke test
         run: |
           set -eu
+          ready=$(kubectl -n apps get deployment article-service \
+            -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
+          if [ "${ready:-0}" = "0" ] || [ -z "${ready:-}" ]; then
+            echo "::notice::article-service is not serving yet — skipping the smoke test"
+            exit 0
+          fi
+
           for i in $(seq 1 10); do
             code=$(curl -sk -o /dev/null -w '%{http_code}' \
               'https://explained.homelab.lan/articles/search?query=k8s' || true)

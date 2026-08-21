@@ -40,6 +40,15 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: ranking-service
+  strategy:
+    # Recreate, not RollingUpdate. This Deployment mounts a local-path PVC, whose PV carries
+    # node affinity — so the old pod and the surge pod must land on the same node, each
+    # holding its own memory request, on a node that has ~2 GB to give. The surge pod sits
+    # Pending with "Insufficient memory" and the rollout never completes.
+    #
+    # The same reasoning already applies to Prometheus and Grafana. Anything here that mounts
+    # a volume wants this, and none of them are replicated anyway.
+    type: Recreate
   template:
     metadata:
       labels:
