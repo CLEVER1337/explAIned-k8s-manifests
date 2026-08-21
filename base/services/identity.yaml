@@ -75,7 +75,7 @@ spec:
             # Composed here rather than stored whole in a Secret: only the password is
             # sensitive, and $(VAR) resolves against envFrom values too.
             - name: ConnectionStrings__PostgreSQL
-              value: Host=$(POSTGRES_HOST);Port=$(POSTGRES_PORT);Database=asd;Username=$(POSTGRES_USER);Password=$(POSTGRES_PASSWORD)
+              value: Host=$(POSTGRES_HOST);Port=$(POSTGRES_PORT);Database=users;Username=$(POSTGRES_USER);Password=$(POSTGRES_PASSWORD)
             - name: ConnectionStrings__Redis
               value: $(REDIS_HOST):$(REDIS_PORT),password=$(REDIS_PASSWORD),abortConnect=false
             # This service mints the tokens the other four validate. Key, issuer and audience

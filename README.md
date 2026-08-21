@@ -134,9 +134,24 @@ functional, and two are Jobs that retry until they can:
 
 | | what | how |
 |---|---|---|
-| 1 | four PostgreSQL databases (`asd`, `articles`, `comments`, `profiles`) | dev: initdb ConfigMap, first boot only. homelab: `pg_app_databases` in the Ansible inventory |
+| 1 | four PostgreSQL databases (`users`, `articles`, `comments`, `profiles`) | dev: initdb ConfigMap, first boot only. homelab: `pg_app_databases` in the Ansible inventory |
 | 2 | two Kafka topics, 3 partitions each | `kafka-create-topics` Job |
 | 3 | ClickHouse schema (`explained.user_events`, `explained.feed_impressions`) | `clickhouse-schema` Job — every statement is `IF NOT EXISTS`, and its `CREATE DATABASE` is allowed to fail where the account may not create one |
+
+Neither mechanism in row 1 can *rename* a database. The initdb ConfigMap runs only against an
+empty data directory, and the Ansible role creates what is listed and never renames. So
+changing an entry in either place gives you an empty database under the new name while the old
+one keeps all the data — and the service, pointed at the new name, migrates into it and comes
+up looking healthy with no accounts in it.
+
+Renaming is a manual step against the running server, taken before the config change:
+
+```bash
+# no active connections, so scale the service down first
+kubectl scale deployment/identity-service --replicas=0
+psql -h <host> -U postgres -c 'ALTER DATABASE asd RENAME TO users;'
+kubectl scale deployment/identity-service --replicas=1
+```
 
 Both Jobs carry `ttlSecondsAfterFinished: 3600`, which matters for a second reason: a Job spec
 is immutable, so re-applying the overlay while a completed one is still around fails if its

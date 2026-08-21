@@ -1,5 +1,5 @@
 # One PostgreSQL instance, four databases — the same shape the services already expect
-# (`asd`, `articles`, `comments`, `profiles`). Each service still owns its own database and
+# (`users`, `articles`, `comments`, `profiles`). Each service still owns its own database and
 # still reaches the others only over HTTP; sharing a server is a packaging decision, not an
 # architectural one. Splitting into four StatefulSets later means changing POSTGRES_HOST per
 # service and nothing else.
@@ -13,9 +13,11 @@ metadata:
 data:
   # Runs once, on an empty data directory only. An existing volume is left alone, so this is
   # not a migration path — new databases for new services have to be created by hand or by a
-  # Job against a live cluster.
+  # Job against a live cluster. Renaming one is the same story: editing this file gives a
+  # fresh volume the new name and gives an existing volume nothing at all. See the note on
+  # renaming in the README.
   10-databases.sql: |
-    CREATE DATABASE asd;
+    CREATE DATABASE users;
     CREATE DATABASE articles;
     CREATE DATABASE comments;
     CREATE DATABASE profiles;
