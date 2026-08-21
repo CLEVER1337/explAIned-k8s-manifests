@@ -126,7 +126,25 @@ jobs:
       - name: Wait for the rollouts
         run: |
           set -eu
-          sort -u /tmp/changed /tmp/healthy-before > /tmp/must-be-ready
+
+          # A third set, subtracted from the other two: workloads still carrying the
+          # placeholder tag from overlays/homelab/images/<svc>/kustomization.yaml. `:main` is
+          # what a component says before that service has ever been released, so those pods
+          # are pulling an image nobody has pushed and no amount of waiting will help.
+          #
+          # "Changed" and "released" are not the same thing, which is what the previous
+          # version of this step got wrong: editing a Deployment's strategy, or an earlier
+          # botched `rollout undo` nudging its template, is enough to make apply report
+          # `configured` for a service that has no image at all.
+          kubectl -n apps get deployments -l app.kubernetes.io/part-of=explained \
+            -o jsonpath='{range .items[*]}{.metadata.name} {.spec.template.spec.containers[0].image}{"\n"}{end}' \
+            | awk '$2 ~ /:main$/ { print "deployment/" $1 }' | sort > /tmp/unreleased
+          if [ -s /tmp/unreleased ]; then
+            echo "never released, so not waited on:"; sed 's/^/  /' /tmp/unreleased
+          fi
+
+          sort -u /tmp/changed /tmp/healthy-before > /tmp/candidates
+          comm -23 /tmp/candidates /tmp/unreleased > /tmp/must-be-ready
 
           failed=""
           while read -r obj; do
@@ -145,7 +163,7 @@ jobs:
             | awk '$2 == "" || $2 != $3 { print tolower($1) }' | sort > /tmp/unready-after
           comm -23 /tmp/unready-after /tmp/must-be-ready > /tmp/ignored || true
           if [ -s /tmp/ignored ]; then
-            echo "::notice::not ready, and not touched by this deploy — unreleased or already broken:"
+            echo "::notice::not ready, and not this deploy's to fix — never released, or already broken:"
             sed 's/^/  /' /tmp/ignored
           fi
 
