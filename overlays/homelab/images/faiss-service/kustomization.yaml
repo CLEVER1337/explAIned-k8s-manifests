@@ -18,4 +18,4 @@ kind: Component
 images:
   - name: explained/faiss-service
     newName: git.homelab.lan/ci/explained-faiss-service
-    newTag: main
+    newTag: v0.0.2
