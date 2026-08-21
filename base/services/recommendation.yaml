@@ -122,14 +122,6 @@ spec:
             - name: Jwt__Audience
               value: $(JWT_AUDIENCE)
           volumeMounts:
-            # subPath, so this replaces the single file instead of mounting over /app and
-            # hiding the DLLs next to it. The trade-off is that subPath mounts do not update
-            # in place — but the ConfigMap is generated with a content hash, so editing it
-            # renames it and rolls the Deployment anyway.
-            - name: appsettings
-              mountPath: /app/appsettings.json
-              subPath: appsettings.json
-              readOnly: true
             - name: tmp
               mountPath: /tmp
           readinessProbe:
@@ -158,8 +150,5 @@ spec:
             capabilities:
               drop: ["ALL"]
       volumes:
-        - name: appsettings
-          configMap:
-            name: recommendation-appsettings
         - name: tmp
           emptyDir: {}

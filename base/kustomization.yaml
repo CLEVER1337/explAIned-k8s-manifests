@@ -63,18 +63,6 @@ configMapGenerator:
     files:
       - services/files/gateway.conf
 
-  # Both of these replace the appsettings.json inside their image, and both are smaller than
-  # the file they replace. The reason is in the files themselves — short version: those two
-  # services re-add appsettings.json as the last configuration provider, which puts it above
-  # environment variables, so anything left in the file cannot be overridden from the
-  # Deployment.
-  - name: recommendation-appsettings
-    files:
-      - appsettings.json=config/recommendation-appsettings.json
-  - name: event-consumer-appsettings
-    files:
-      - appsettings.json=config/event-consumer-appsettings.json
-
   - name: prometheus-config
     files:
       - monitoring/files/prometheus.yml

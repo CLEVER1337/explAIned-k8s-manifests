@@ -73,22 +73,27 @@ overlay and nothing else changes.
 Six Secrets, supplied by the overlay: `explained-postgres`, `explained-redis`,
 `explained-clickhouse`, `explained-elasticsearch`, `explained-jwt`, `explained-grafana`.
 
-### The one thing that will bite you
+### One trap, and why there is no longer a workaround for it
 
-`explAInedRecommendationService/Program.cs` and
-`explAInedArticleEventConsumerService/Program.cs` both call
-`builder.Configuration.AddJsonFile("appsettings.json")`. `CreateBuilder` has already loaded
-that file; adding it again appends it as the **last** provider, and the last provider wins —
-above environment variables. So for those two services, and only those two,
-`ConnectionStrings__Redis` and friends set in the Deployment are silently ignored and the
-service dials `localhost`.
+Configuration precedence in ASP.NET Core runs bottom-up: `appsettings.json`, then
+`appsettings.{Environment}.json`, then user secrets, then **environment variables**, then
+command-line arguments. The last provider wins, which is what makes `ConnectionStrings__Redis`
+in a Deployment override the localhost default a developer runs against. `__` maps to `:`.
 
-The workaround here is to mount a *smaller* `appsettings.json` over the one in the image
-(`base/config/*-appsettings.json`), keeping only genuinely static settings — log levels, the
-feed's latency budget, the sink's batch size — and deleting every addressable key. What is not
-in the file cannot shadow anything, so env vars work normally again.
+That order used to be inverted in two services. `explAInedRecommendationService/Program.cs`
+and `explAInedArticleEventConsumerService/Program.cs` each called
+`builder.Configuration.AddJsonFile("appsettings.json")` — a file `CreateBuilder` had already
+loaded — which appended it as a sixth provider, above the environment. Every addressable
+setting the Deployment supplied was silently ignored and both dialled `localhost`.
 
-**Deleting those two `AddJsonFile` lines upstream makes both files unnecessary.**
+This repository used to work around it by mounting a stripped-down `appsettings.json` over the
+one in the image, keeping only what is genuinely static. **Both lines are now gone upstream**,
+so the workaround went with them: no `configMapGenerator`, no `subPath` mounts, no
+`base/config/*-appsettings.json`. All nine services now read configuration the same way.
+
+If you ever see a service ignoring an environment variable you are certain you set, this is
+the first thing to check — `grep -rn AddJsonFile` across the service directories should return
+nothing.
 
 ## Routing
 
