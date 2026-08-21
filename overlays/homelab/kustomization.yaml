@@ -21,25 +21,20 @@ resources:
 # No components. Both of them describe things this cluster either already has or will not
 # allow — see the header.
 
-secretGenerator:
-  - name: explained-postgres
-    envs:
-      - secrets/postgres.env
-  - name: explained-redis
-    envs:
-      - secrets/redis.env
-  - name: explained-elasticsearch
-    envs:
-      - secrets/elasticsearch.env
-  - name: explained-clickhouse
-    envs:
-      - secrets/clickhouse.env
-  - name: explained-jwt
-    envs:
-      - secrets/jwt.env
-  - name: explained-grafana
-    envs:
-      - secrets/grafana.env
+# No secretGenerator. The six Secrets this stack needs — explained-postgres,
+# -clickhouse, -elasticsearch, -redis, -jwt, -grafana — are created in the `apps`
+# namespace by Ansible (clever-homelab, roles/k3s_server/tasks/app_secrets.yml).
+#
+# That is what lets the deploy pipeline hold no credential but the kubeconfig.
+# Generating them here would mean the env files had to exist at `kustomize build`
+# time, which would mean every database password sitting in Forgejo's Actions
+# secrets — on the one guest that runs unreviewed code by design.
+#
+# Two consequences worth knowing:
+#   - Apply this overlay before `make configure` has run and the pods sit in
+#     CreateContainerConfigError. That is the correct failure, and it is legible.
+#   - These names carry no content hash, so rotating a password does not roll the
+#     pods that mount it. `make restart OVERLAY=homelab` is the other half.
 
 # One of everything. Not a starting point to tune later: two replicas of the eight workloads
 # would not fit, and the HPAs that would normally decide this cannot be created here anyway.
@@ -411,37 +406,19 @@ patches:
         path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
         value: 1Gi
 
-# Forgejo's registry, scoped to the `ci` account that pushes there. No imagePullSecrets on any
-# pod: the homelab attaches `forgejo-registry` to the namespace's default ServiceAccount, so
-# a pull just works.
+# The deployed version of each service lives in its own component under
+# images/, one file each, rewritten by that service's release workflow. See any
+# of them for why they are not a single `images:` block here.
 #
-# The tags are what CI sets — `kustomize edit set image explained/article-service=...:$SHA`
-# in the workflow, not an edit by hand. `main` is the fallback for a manual apply.
-images:
-  - name: explained/identity-service
-    newName: git.homelab.lan/ci/explained-identity-service
-    newTag: main
-  - name: explained/article-service
-    newName: git.homelab.lan/ci/explained-article-service
-    newTag: main
-  - name: explained/comment-service
-    newName: git.homelab.lan/ci/explained-comment-service
-    newTag: main
-  - name: explained/profile-service
-    newName: git.homelab.lan/ci/explained-profile-service
-    newTag: main
-  - name: explained/recommendation-service
-    newName: git.homelab.lan/ci/explained-recommendation-service
-    newTag: main
-  - name: explained/event-consumer-service
-    newName: git.homelab.lan/ci/explained-event-consumer-service
-    newTag: main
-  - name: explained/faiss-service
-    newName: git.homelab.lan/ci/explained-faiss-service
-    newTag: main
-  - name: explained/ranking-service
-    newName: git.homelab.lan/ci/explained-ranking-service
-    newTag: main
-  - name: explained/ml-jobs
-    newName: git.homelab.lan/ci/explained-ml-jobs
-    newTag: main
+# No imagePullSecrets on any pod: the homelab attaches `forgejo-registry` to the
+# namespace's default ServiceAccount, so a pull just works.
+components:
+  - images/identity-service
+  - images/article-service
+  - images/comment-service
+  - images/profile-service
+  - images/recommendation-service
+  - images/event-consumer-service
+  - images/faiss-service
+  - images/ranking-service
+  - images/ml-jobs

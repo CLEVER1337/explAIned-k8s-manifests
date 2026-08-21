@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# The deployed version of identity-service, and nothing else.
+#
+# One file per service on purpose. The release workflow in each application
+# repository rewrites its own file and pushes; nine repositories therefore never
+# touch the same lines, and two releases landing in the same minute rebase past
+# each other instead of conflicting. Keeping all nine in the overlay's `images:`
+# block would put adjacent three-line entries in one file, which is exactly the
+# shape git cannot auto-merge.
+#
+# It also means `git log overlays/homelab/images/identity-service/` is that
+# one service's deployment history.
+#
+# Written by CI:
+#   kustomize edit set image explained/identity-service=<registry>/<image>:<tag>
+images:
+  - name: explained/identity-service
+    newName: git.homelab.lan/ci/explained-identity-service
+    newTag: main

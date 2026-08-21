@@ -1,0 +1,147 @@
+# The only thing in the whole system that talks to the cluster.
+#
+# Nine application repositories build images and push them to Forgejo's registry. None of
+# them holds a kubeconfig. What a release does instead is rewrite one line in
+# overlays/homelab/images/<service>/kustomization.yaml and push that commit here — and this
+# workflow turns the commit into cluster state.
+#
+# Three things follow from that, and they are the whole reason for the shape:
+#   - one credential. KUBE_CONFIG exists in this repository's secrets and nowhere else.
+#   - the git log is the deploy log. `git log overlays/homelab/images/` is every release.
+#   - rollback is `git revert`. It runs the same path as a deploy, because it is one.
+#
+# It also applies on a manual edit to the manifests, which is correct: this repository is the
+# desired state, not just a place tags land.
+
+name: deploy
+
+on:
+  push:
+    branches: [master]
+    # A change to the dev overlay cannot affect the homelab, and rendering it needs
+    # the committed dev credentials that this job has no reason to touch.
+    paths-ignore:
+      - 'overlays/dev/**'
+      - 'README.md'
+      - '**/README.md'
+  # For re-applying after an out-of-band change, or after fixing something in the cluster
+  # by hand and wanting the declared state back.
+  workflow_dispatch:
+
+# One deploy at a time. Two releases landing together would otherwise race on `kubectl
+# apply`, and the loser would report success having applied the older tree.
+concurrency:
+  group: deploy-homelab
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+
+      # The job image is `node`, which has neither. Both are pinned: kubectl to the
+      # cluster's own minor version, because skew beyond ±1 is unsupported and the failure
+      # is obscure. dl.k8s.io answers from this runner; several other release hosts do not.
+      - name: Install kubectl and kustomize
+        run: |
+          set -eu
+          curl -sSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+          curl -sSL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin
+          kubectl version --client
+          kustomize version
+
+      - name: Point at the cluster
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          set -eu
+          test -n "$KUBE_CONFIG" || { echo "KUBE_CONFIG secret is empty"; exit 1; }
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG" > "$HOME/.kube/config"
+          chmod 0600 "$HOME/.kube/config"
+          # This account may not list namespaces, so `get nodes` is not the smoke test.
+          # Something it is actually allowed to do is.
+          kubectl -n apps get deployments >/dev/null
+          echo "reached the cluster as $(kubectl config current-context)"
+
+      # Renders before touching anything. A kustomize error here — a bad patch path, a
+      # component that does not exist — should fail the job, not produce a partial apply.
+      - name: Render
+        run: |
+          set -eu
+          kustomize build overlays/homelab > /tmp/rendered.yaml
+          wc -l /tmp/rendered.yaml
+          grep -E '^\s+image: ' /tmp/rendered.yaml | sort -u
+
+      # The two bootstrap Jobs are immutable once created, so an apply that changes their
+      # spec fails with "field is immutable" and takes the whole deploy with it. They carry
+      # ttlSecondsAfterFinished, so most of the time they are simply gone — this deletes
+      # whatever is left over and lets the apply recreate them.
+      - name: Clear the bootstrap jobs
+        run: |
+          kubectl -n apps delete job kafka-create-topics clickhouse-schema \
+            --ignore-not-found --wait=true
+
+      - name: Apply
+        run: kubectl -n apps apply -f /tmp/rendered.yaml
+
+      # `apply` returns as soon as the API server has the objects. This is what turns a
+      # green tick into a statement about running pods.
+      #
+      # CronJobs are deliberately not waited on: a new ml-jobs tag does not "roll out", it
+      # takes effect at the next scheduled run. That part of the deploy is invisible here.
+      - name: Wait for the rollouts
+        run: |
+          set -eu
+          failed=""
+          for d in $(kubectl -n apps get deployments -l app.kubernetes.io/part-of=explained \
+                       -o jsonpath='{.items[*].metadata.name}'); do
+            echo "--- $d"
+            kubectl -n apps rollout status "deployment/$d" --timeout=180s || failed="$failed $d"
+          done
+          for s in $(kubectl -n apps get statefulsets -l app.kubernetes.io/part-of=explained \
+                       -o jsonpath='{.items[*].metadata.name}'); do
+            echo "--- $s"
+            kubectl -n apps rollout status "statefulset/$s" --timeout=300s || failed="$failed $s"
+          done
+          test -z "$failed" || { echo "did not become ready:$failed"; exit 1; }
+
+      # Only what actually failed, and only Deployments — `rollout undo` on a StatefulSet
+      # holding a volume is not a thing to do unattended.
+      #
+      # This puts the cluster back on the previous ReplicaSet, which means it no longer
+      # matches git. Revert the offending commit; do not re-run this workflow and expect it
+      # to notice.
+      - name: Roll back what failed
+        if: failure()
+        run: |
+          for d in $(kubectl -n apps get deployments -l app.kubernetes.io/part-of=explained \
+                       -o jsonpath='{.items[*].metadata.name}'); do
+            ready=$(kubectl -n apps get deployment "$d" -o jsonpath='{.status.readyReplicas}')
+            want=$(kubectl -n apps get deployment "$d" -o jsonpath='{.spec.replicas}')
+            if [ "${ready:-0}" != "$want" ]; then
+              echo "rolling back $d"
+              kubectl -n apps rollout undo "deployment/$d" || true
+            fi
+          done
+          echo "::warning::rolled back — the cluster no longer matches master, revert the commit"
+
+      # Through Caddy, on the real hostname, exactly as a user would reach it. Catches the
+      # case every probe in this repository misses: a green rollout in front of an
+      # application that cannot answer, because the probes hit /metrics and prove only that
+      # Kestrel is listening.
+      - name: Smoke test
+        run: |
+          set -eu
+          for i in $(seq 1 10); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' \
+              'https://explained.homelab.lan/articles/search?query=k8s' || true)
+            echo "attempt $i: $code"
+            case "$code" in 200|204) exit 0 ;; esac
+            sleep 6
+          done
+          echo "::error::the API never answered 2xx through the ingress"
+          exit 1
