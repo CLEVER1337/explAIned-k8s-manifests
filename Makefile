@@ -6,7 +6,9 @@ TAG ?= dev
 # services, so the default is simply the parent.
 SRC ?= ..
 
-.PHONY: help build diff apply delete restart images push sync-upstream check-drift
+BASE ?= https://explained.homelab.lan
+
+.PHONY: help build diff apply delete restart images push sync-upstream check-drift verify
 
 help:
 	@echo "make build      OVERLAY=dev|homelab   render manifests to stdout"
@@ -18,6 +20,7 @@ help:
 	@echo "make push       TAG=... REGISTRY=...  push them"
 	@echo "make sync-upstream                    re-copy the files vendored from $(SRC)"
 	@echo "make check-drift                      fail if those copies have drifted"
+	@echo "make verify     [BASE=https://...]    drive the deployed stack end to end and assert on it"
 
 # The namespace differs per overlay — `explained` for dev, the pre-existing `apps` on the
 # homelab — so it is read off the overlay rather than duplicated here. Reading the
@@ -75,3 +78,11 @@ check-drift:
 	@diff -q $(SRC)/monitoring/grafana/provisioning/dashboards/microservices.json base/monitoring/files/microservices.json \
 	  || { echo "microservices.json has drifted — run make sync-upstream"; exit 1; }
 	@echo "vendored files match $(SRC)"
+
+# Black-box end-to-end check: registers a user, publishes an article, comments on it, reads
+# the feed. Deliberately not `kubectl`-first — every probe in this repository hits /metrics,
+# which proves Kestrel is listening and nothing more. This drives the system the way a user
+# does, and the one assertion worth the whole script is that a search finds an article
+# created seconds earlier, because only the outbox, Kafka and the indexer can put it there.
+verify:
+	BASE=$(BASE) ./scripts/verify.sh
