@@ -18,4 +18,4 @@ kind: Component
 images:
   - name: explained/profile-service
     newName: git.homelab.lan/ci/explained-profile-service
-    newTag: main
+    newTag: v0.1.0
