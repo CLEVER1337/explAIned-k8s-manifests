@@ -18,4 +18,4 @@ kind: Component
 images:
   - name: explained/event-consumer-service
     newName: git.homelab.lan/ci/explained-event-consumer-service
-    newTag: main
+    newTag: v0.1.0
