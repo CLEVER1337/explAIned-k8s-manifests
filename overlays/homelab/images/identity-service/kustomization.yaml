@@ -18,4 +18,4 @@ kind: Component
 images:
   - name: explained/identity-service
     newName: git.homelab.lan/ci/explained-identity-service
-    newTag: main
+    newTag: v0.1.0
