@@ -18,4 +18,4 @@ kind: Component
 images:
   - name: explained/ranking-service
     newName: git.homelab.lan/ci/explained-ranking-service
-    newTag: main
+    newTag: v0.1.1

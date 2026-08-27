@@ -18,4 +18,4 @@ kind: Component
 images:
   - name: explained/ml-jobs
     newName: git.homelab.lan/ci/explained-ml-jobs
-    newTag: main
+    newTag: v0.1.1
