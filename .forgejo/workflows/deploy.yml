@@ -40,18 +40,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The job image is `node`, which has neither. Both are pinned: kubectl to the
-      # cluster's own minor version, because skew beyond ±1 is unsupported and the failure
-      # is obscure. dl.k8s.io answers from this runner; several other release hosts do not.
-      - name: Install kubectl and kustomize
+      # The job image is `node`, which has no kubectl. Pinned to the cluster's own minor
+      # version, because skew beyond ±1 is unsupported and the failure is obscure.
+      #
+      # kubectl only. There used to be a second download here, the standalone kustomize
+      # tarball from github.com, and it was both unnecessary and the single least reliable
+      # thing in this file: kubectl has embedded kustomize since 1.14 and it is v5 on any
+      # kubectl new enough to run against this cluster, which is the only version constraint
+      # this repository has. The tarball fetch hung for five minutes and took two deploys
+      # down with it — including a release that had already built and pushed its image, so
+      # the tag sat in the registry looking deployed while the cluster ran the old one.
+      #
+      # dl.k8s.io answers from this runner; github.com release downloads do not, reliably.
+      # The retry flags are for the day it is dl.k8s.io having the bad afternoon.
+      - name: Install kubectl
         run: |
           set -eu
-          curl -sSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl
+          curl -sSLo /usr/local/bin/kubectl \
+            --retry 3 --retry-delay 5 --retry-connrefused --connect-timeout 15 --max-time 120 \
+            https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl
           chmod +x /usr/local/bin/kubectl
-          curl -sSL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz \
-            | tar -xz -C /usr/local/bin
           kubectl version --client
-          kustomize version
 
       - name: Point at the cluster
         env:
@@ -72,7 +81,7 @@ jobs:
       - name: Render
         run: |
           set -eu
-          kustomize build overlays/homelab > /tmp/rendered.yaml
+          kubectl kustomize overlays/homelab > /tmp/rendered.yaml
           wc -l /tmp/rendered.yaml
           grep -E '^\s+image: ' /tmp/rendered.yaml | sort -u
 
