@@ -18,4 +18,4 @@ kind: Component
 images:
   - name: explained/article-service
     newName: git.homelab.lan/ci/explained-article-service
-    newTag: main
+    newTag: v0.1.0
