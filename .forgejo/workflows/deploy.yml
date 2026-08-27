@@ -202,9 +202,17 @@ jobs:
       # Kestrel is listening.
       #
       # Skipped while the service behind the path has never been released. Asserting that
-      # /articles/search answers 200 is only meaningful once article-service has an image —
-      # until then the gateway correctly returns 502 and failing on it would say nothing
-      # about this deploy.
+      # the API answers 200 is only meaningful once article-service has an image — until
+      # then the gateway correctly returns 502 and failing on it would say nothing about
+      # this deploy.
+      #
+      # /articles/recent and not /articles/search, which was the first choice and is wrong:
+      # SearchArticles returns `Results.NotFound("No articles found")` on an empty result,
+      # so on a cluster nobody has written an article into yet the endpoint answers 404 by
+      # design and the test can never pass. GetRecentArticles returns Ok unconditionally,
+      # which makes an empty database a 200 with `[]` — the same full path through Caddy,
+      # the NodePort, the gateway and into PostgreSQL, but an assertion about reachability
+      # rather than about content.
       - name: Smoke test
         run: |
           set -eu
@@ -217,9 +225,15 @@ jobs:
 
           for i in $(seq 1 10); do
             code=$(curl -sk -o /dev/null -w '%{http_code}' \
-              'https://explained.homelab.lan/articles/search?query=k8s' || true)
+              'https://explained.homelab.lan/articles/recent?limit=1' || true)
             echo "attempt $i: $code"
             case "$code" in 200|204) exit 0 ;; esac
+            # 000 is curl failing to connect at all, which here means the name did not
+            # resolve — the runner passes one --add-host per name Caddy answers for, and a
+            # newly published application needs the ansible play re-run before CI can see it.
+            if [ "$code" = "000" ] && [ "$i" = "1" ]; then
+              echo "::warning::curl could not connect — is explained.homelab.lan in the runner's --add-host list?"
+            fi
             sleep 6
           done
           echo "::error::the API never answered 2xx through the ingress"
