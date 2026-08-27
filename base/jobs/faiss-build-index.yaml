@@ -31,6 +31,10 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 2
+      # Forbid plus a Job that can never finish wedges this schedule permanently — see the
+      # header of jobs/ml-cronjobs.yaml, where the same thing happened to five CronJobs at
+      # once. Generous against a 30-minute cadence; a liveness bound, not a target.
+      activeDeadlineSeconds: 1800
       template:
         metadata:
           labels:

@@ -20,6 +20,23 @@
 # On all of them. Two train_als runs overlapping produce interleaved writes to
 # rec:user_als_candidates:*; two embeddings runs just burn CPU racing each other.
 #
+# ── activeDeadlineSeconds, and why Forbid needs it ───────────────────────────────────────
+# Forbid skips a run while the previous Job is still active, which is correct right up to
+# the moment a Job becomes active *and cannot finish*. Then the schedule is wedged, and
+# nothing in the CronJob clears it: backoffLimit counts pod failures, and a pod stuck in
+# ImagePullBackOff has not failed — it is waiting. Forever, as it turns out.
+#
+# That is not hypothetical. These CronJobs were applied while their image tag was still the
+# `main` placeholder, so five of them held a Job from five days earlier that could never
+# pull. Every schedule in between was skipped, silently, and deleting the Jobs by hand was
+# the only way out.
+#
+# activeDeadlineSeconds is the ceiling that makes the wedge self-clearing: the Job is
+# terminated and marked Failed, Forbid stops matching, and the next tick runs. The values
+# below are generous multiples of what each job should take on a homelab-sized corpus —
+# they are a liveness bound, not a performance target. A job that legitimately needs longer
+# should have this raised rather than removed.
+#
 # ── Schedules ────────────────────────────────────────────────────────────────────────────
 # Staggered rather than aligned, because the chain has a real order:
 #   embeddings → (build-index, in jobs/faiss-build-index.yaml) → the FAISS candidate source
@@ -43,6 +60,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 2
+      activeDeadlineSeconds: 1800
       template:
         metadata:
           labels:
@@ -113,6 +131,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 2
+      activeDeadlineSeconds: 600
       template:
         metadata:
           labels:
@@ -176,6 +195,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 2
+      activeDeadlineSeconds: 1800
       template:
         metadata:
           labels:
@@ -235,6 +255,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 2
+      activeDeadlineSeconds: 1800
       template:
         metadata:
           labels:
@@ -297,6 +318,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 1
+      activeDeadlineSeconds: 3600
       template:
         metadata:
           labels:
@@ -361,6 +383,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 1
+      activeDeadlineSeconds: 3600
       template:
         metadata:
           labels:
