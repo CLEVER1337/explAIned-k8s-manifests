@@ -3,6 +3,12 @@ apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
+    # Pinned, not generated. Every panel in microservices.json refers to its datasource as
+    # {"type": "prometheus", "uid": "prometheus"} — fifteen of them — because that is the uid
+    # the docker-compose stack provisioned. Leave this out and Grafana mints a random uid,
+    # the dashboard resolves to nothing, and every panel reads "datasource prometheus was
+    # not found" while the datasource itself tests green on its own settings page.
+    uid: prometheus
     access: proxy
     # In-cluster Service, not localhost — the compose stack ran both on the host network.
     url: http://prometheus:9090
